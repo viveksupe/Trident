@@ -1,0 +1,7 @@
+/bin/
+/manifest/values.sh
+*.db
+*.db-wal
+*.db-shm
+/tmp/
+.DS_Store

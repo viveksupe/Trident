@@ -1,0 +1,33 @@
+# Worker pool for trident actors (rendered by scripts/deploy.sh with
+# TRI_ATESPACE as the namespace, then applied with kubectl — the WorkerPool
+# is a Kubernetes CRD, unlike the ActorTemplate which goes through the ate API).
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${WORKERPOOL_NAMESPACE}
+
+---
+
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: ot-terminal-workerpool
+  namespace: ${WORKERPOOL_NAMESPACE}
+  labels:
+    workload: ot-terminal
+spec:
+  replicas: ${WORKERPOOL_REPLICAS}
+  workerImage: ${WORKER_IMAGE} # digest-pinned ateworker image the nodes can pull
+  template:
+    # One worker per running actor: the limits match the ActorTemplate's
+    # (CPU_MILLICORES / MEMORY_BYTES) plus worker overhead.
+    resources:
+      limits:
+        cpu: "${WORKERPOOL_CPU}"
+        memory: ${WORKERPOOL_MEMORY}
+      requests:
+        cpu: 250m
+        memory: ${WORKERPOOL_MEMORY}
+  sandboxClasses:
+  - name: gvisor

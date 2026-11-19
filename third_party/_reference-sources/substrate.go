@@ -1,0 +1,235 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package steps
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"sigs.k8s.io/yaml"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/internal/ateclient"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+// AteClient connects to the ate-api-server, port-forwarding if needed. It
+// opts in to preview features if the install enables any.
+func (e *Env) AteClient(ctx context.Context) (*ateclient.Client, error) {
+	var opts []grpc.DialOption
+	if len(e.Cfg.PreviewGates) > 0 {
+		opts = preview.DialOptionsWithOptIn()
+	}
+	return ateclient.NewClient(ctx, e.Cfg.Kubeconfig, e.Cfg.Context, "", "", false, opts...)
+}
+
+// EnsureAtespace creates the atespace if it does not already exist. The store
+// enforces that an ActorTemplate's atespace exists at create time.
+func EnsureAtespace(ctx context.Context, client *ateclient.Client, atespace string) error {
+	_, err := client.CreateAtespace(ctx, &ateapi.CreateAtespaceRequest{
+		Atespace: &ateapi.Atespace{
+			Metadata: &ateapi.ResourceMetadata{Name: atespace},
+		},
+	})
+	if status.Code(err) == codes.AlreadyExists {
+		return nil
+	}
+	return err
+}
+
+// ActorTemplateFromManifest parses a single protojson-shaped YAML or JSON
+// document into an ActorTemplate, as `kubectl ate create actor-template`
+// does. Parsing is strict: unknown fields are an error, so typos don't
+// silently drop configuration.
+func ActorTemplateFromManifest(manifest []byte) (*ateapi.ActorTemplate, error) {
+	jsonData, err := yaml.YAMLToJSON(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("invalid YAML: %w", err)
+	}
+	if string(jsonData) == "null" {
+		return nil, fmt.Errorf("manifest is empty")
+	}
+	template := &ateapi.ActorTemplate{}
+	if err := protojson.Unmarshal(jsonData, template); err != nil {
+		return nil, err
+	}
+	return template, nil
+}
+
+// CreateActorTemplate creates the template through the ate API. Actor
+// templates are immutable (no update RPC), so an existing template is left
+// in place: delete the demo and redeploy to change it.
+func CreateActorTemplate(ctx context.Context, client *ateclient.Client, template *ateapi.ActorTemplate) error {
+	ref := resources.ActorTemplateRefFromActorTemplate(template)
+	_, err := client.CreateActorTemplate(ctx, &ateapi.CreateActorTemplateRequest{ActorTemplate: template})
+	if status.Code(err) == codes.AlreadyExists {
+		log.Stepf("actor template %s already exists; keeping it (delete the demo to replace it)", ref)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("creating actor template %s: %w", ref, err)
+	}
+	return nil
+}
+
+// CreateActor creates an actor from template through the ate API, leaving an
+// existing actor in place so re-running deploy is idempotent.
+func CreateActor(ctx context.Context, client *ateclient.Client, actor resources.ActorRef, template resources.ActorTemplateRef) error {
+	_, err := client.CreateActor(ctx, &ateapi.CreateActorRequest{
+		Actor: &ateapi.Actor{
+			Metadata: &ateapi.ResourceMetadata{
+				Atespace: actor.Atespace,
+				Name:     actor.Name,
+			},
+			ActorTemplate: template.ToObjectRef(),
+		},
+	})
+	if status.Code(err) == codes.AlreadyExists {
+		log.Stepf("actor %s already exists; keeping it", actor)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("creating actor %s: %w", actor, err)
+	}
+	return nil
+}
+
+// CreateActorEgressPolicy gives actor an egress policy with rules, leaving an
+// existing policy in place so re-running deploy is idempotent.
+func CreateActorEgressPolicy(ctx context.Context, client *ateclient.Client, actor resources.ActorRef, rules []*ateapi.EgressRule) error {
+	_, err := client.CreateActorEgressPolicy(ctx, &ateapi.CreateActorEgressPolicyRequest{
+		Actor: actor.ToObjectRef(),
+		EgressPolicy: &ateapi.EgressPolicy{
+			Metadata: &ateapi.ResourceMetadata{
+				Atespace: actor.Atespace,
+				Name:     resources.SingletonName,
+			},
+			Rules: rules,
+		},
+	})
+	if status.Code(err) == codes.AlreadyExists {
+		log.Stepf("egress policy for actor %s already exists; keeping it", actor)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("creating egress policy for actor %s: %w", actor, err)
+	}
+	return nil
+}
+
+// WaitActorTemplateGolden blocks until the template's golden snapshot is
+// built. It fails fast when the template reconciler reports an error, and
+// returns immediately for a template that opted out of the golden snapshot.
+func WaitActorTemplateGolden(ctx context.Context, client *ateclient.Client, ref resources.ActorTemplateRef, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	// The last Get error rides along in the timeout error: a wait that spent
+	// its whole budget on a broken connection should say so, not point at the
+	// template reconciler.
+	var lastErr error
+	for {
+		template, err := client.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{ActorTemplate: ref.ToObjectRef()})
+		lastErr = err
+		if err == nil {
+			if template.GetSnapshotConfig().GetGoldenSnapshotConfig().GetMode() == ateapi.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED {
+				// The template opted out: no golden snapshot will ever appear,
+				// and none is needed.
+				return nil
+			}
+			goldenStatus := template.GetStatus().GetGoldenSnapshotStatus()
+			if goldenStatus.GetGoldenTag().GetName() != "" {
+				return nil
+			}
+			if msg := goldenStatus.GetErrorMessage(); msg != "" {
+				return fmt.Errorf("actor template %s failed: %s", ref, msg)
+			}
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("timed out waiting for actor template %s golden snapshot: last error: %w", ref, lastErr)
+			}
+			return fmt.Errorf("timed out waiting for actor template %s golden snapshot", ref)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// DeleteSubstrateDemo removes a substrate demo's control-plane resources:
+// every actor created from the given templates, then the templates (which
+// server-side also removes their golden actors and snapshots), then the
+// atespaces. A cluster without a reachable
+// ate-api-server is not an error -- there is nothing to clean up.
+func (e *Env) DeleteSubstrateDemo(ctx context.Context, refs []resources.ActorTemplateRef, atespaces []string) error {
+	present, err := e.Kube.DeploymentExists(ctx, e.Namespace(), "ate-api-server")
+	if err != nil {
+		return err
+	}
+	if !present {
+		log.Step("ate-api-server not found; skipping actor cleanup")
+		return nil
+	}
+
+	client, err := e.AteClient(ctx)
+	if err != nil {
+		log.Warnf("could not connect to ate-api-server; skipping actor cleanup: %v", err)
+		return nil
+	}
+	defer client.Close()
+
+	actors, err := listAllActors(ctx, client)
+	if err != nil {
+		log.Warnf("could not list actors; skipping actor cleanup: %v", err)
+		return nil
+	}
+
+	for _, ref := range refs {
+		log.Stepf("Deleting actors for %s", ref)
+		for _, actor := range actors {
+			if resources.ActorTemplateRefFromObjectRef(actor.GetActorTemplate()) != ref {
+				continue
+			}
+			actorRef := resources.ActorRefFromActor(actor)
+			log.Stepf("  deleting actor %s/%s", actorRef.Atespace, actorRef.Name)
+			if _, err := client.DeleteActor(ctx, &ateapi.DeleteActorRequest{
+				Actor: actorRef.ToObjectRef(),
+			}); err != nil {
+				log.Warnf("while deleting actor %s/%s: %v", actorRef.Atespace, actorRef.Name, err)
+			}
+		}
+	}
+
+	for _, ref := range refs {
+		if _, err := client.DeleteActorTemplate(ctx, &ateapi.DeleteActorTemplateRequest{ActorTemplate: ref.ToObjectRef()}); err != nil && status.Code(err) != codes.NotFound {
+			log.Warnf("while deleting actor template %s: %v", ref, err)
+		}
+	}
+
+	for _, atespace := range atespaces {
+		if _, err := client.DeleteAtespace(ctx, &ateapi.DeleteAtespaceRequest{Atespace: &ateapi.ObjectRef{Name: atespace}}); err != nil && status.Code(err) != codes.NotFound {
+			log.Warnf("while deleting atespace %s: %v", atespace, err)
+		}
+	}
+	return nil
+}

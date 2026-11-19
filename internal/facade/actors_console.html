@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trident · sandbox actors</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#2a3139; --text:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --bad:#f85149; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f8fa; --panel:#fff; --line:#d0d7de; --text:#1f2328; --muted:#656d76; --accent:#0969da; } }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, sans-serif; }
+  main { max-width:880px; margin:0 auto; padding:24px 16px 60px; }
+  h1 { font-size:18px; margin:0 0 4px; } h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:28px 0 8px; }
+  .sub { color:var(--muted); margin-bottom:16px; }
+  input { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; }
+  button.revoke { background:transparent; color:var(--bad); border:1px solid var(--bad); }
+  button.suspend { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 16px; margin:8px 0; }
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .mono { font-family:ui-monospace, monospace; font-size:12px; color:var(--muted); }
+  .badge { border:1px solid var(--line); border-radius:999px; padding:1px 8px; font-size:11px; color:var(--muted); }
+  .empty { color:var(--muted); font-style:italic; }
+</style>
+</head>
+<body>
+<script>window.__defaultToken = /*DEFAULT_TOKEN_INJECT*/"" ;</script>
+
+<!-- token settings: top-right key button -->
+<div id="tokwidget" style="position:fixed;top:14px;right:14px;z-index:10;">
+  <button id="tokbtn" title="console token settings" onclick="toggleTokPanel()" style="background:var(--panel);border:1px solid var(--line);border-radius:999px;width:40px;height:40px;cursor:pointer;font-size:17px;position:relative;">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--text)"><circle cx="8" cy="8" r="5"/><path d="M12 12l9 9M17 17l2-2M19.5 14.5l2-2"/></svg>
+    <span id="tokdot" style="position:absolute;top:-2px;right:-2px;width:10px;height:10px;border-radius:50%;background:var(--bad);display:none;"></span>
+  </button>
+  <div id="tokpanel" style="display:none;position:absolute;top:46px;right:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;min-width:260px;box-shadow:0 8px 24px rgba(0,0,0,.35);">
+    <div style="color:var(--muted);font-size:12px;margin-bottom:6px;">Console token</div>
+    <input id="tok2" type="password" placeholder="console token" style="width:100%;margin-bottom:8px;box-sizing:border-box;">
+    <div style="display:flex;gap:8px;">
+      <button style="padding:6px 12px;" onclick="saveTokPanel()">Save</button>
+      <button id="tokclear" class="ghost" style="background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:6px 12px;cursor:pointer;" onclick="clearTokPanel()">Clear</button>
+    </div>
+    <div id="tokstate" style="color:var(--muted);font-size:11px;margin-top:8px;"></div>
+  </div>
+</div>
+<script>
+function toggleTokPanel() {
+  const p = document.getElementById('tokpanel');
+  p.style.display = (p.style.display === 'none') ? 'block' : 'none';
+  refreshTokUI();
+}
+function tokSaved() { return !!(localStorage.getItem('ots-console-token') || window.__defaultToken); }
+function refreshTokUI() {
+  const saved = localStorage.getItem('ots-console-token');
+  const dot = document.getElementById('tokdot');
+  const inp = document.getElementById('tok2');
+  const st = document.getElementById('tokstate');
+  if (inp) { if (!saved) { inp.value = window.__defaultToken || ''; inp.type = 'text'; } else { inp.type = 'password'; inp.value = saved; } }
+  if (dot) dot.style.display = saved ? 'none' : 'block';
+  if (st) st.textContent = saved ? 'token saved in this browser' : (window.__defaultToken ? 'using the default token (not saved yet)' : 'no token set');
+}
+function saveTokPanel() {
+  const v = document.getElementById('tok2').value.trim();
+  if (v) localStorage.setItem('ots-console-token', v);
+  const el = document.getElementById('tokpanel');
+  el.style.display = 'none';
+  const main = document.getElementById('tok') || document.getElementById('tokrow-input');
+  if (main && saved) {}
+  if (typeof refresh === 'function') refresh();
+}
+function clearTokPanel() { localStorage.removeItem('ots-console-token'); refreshTokUI(); if (typeof refresh === 'function') refresh(); }
+</script>
+
+<main>
+  <nav style="display:flex;gap:8px;margin-bottom:18px;">
+    <a href="/_trident/console/egress" style="color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:6px 12px;text-decoration:none;">Egress approvals</a>
+    <a href="/_trident/console/actors" style="color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 12px;text-decoration:none;font-weight:600;">Sandbox actors</a>
+  </nav>
+  <h1>Sandbox actors</h1>
+  <div class="sub">Every chat is one substrate actor. Deleting destroys its durable volume (files, agent credentials). Suspending frees the worker but keeps state. Idle chats auto-suspend and are auto-deleted after the idle-delete TTL.</div>
+  <div id="list"><div class="empty">loading…</div></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+
+const auth = () => ({'Authorization': 'Bearer ' + localStorage.getItem('ots-console-token')});
+async function api(path, opts) { return fetch(path, {headers: auth(), ...opts}); }
+function esc(s) { return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function card(a) {
+  return `<div class="card"><div class="row">
+    <span class="mono" style="color:var(--text)">${esc(a.name)}</span>
+    <span class="badge">${esc(a.state||'?')}</span>
+    ${a.template ? `<span class="badge">template ${esc(a.template)}</span>` : ''}
+    ${a.created ? `<span class="badge">created ${esc(a.created)}</span>` : ''}
+    <span class="row" style="margin-left:auto">
+      <button class="suspend" onclick="act('${esc(a.name)}','suspend')">Suspend</button>
+      <button class="revoke" onclick="act('${esc(a.name)}','delete')" title="Terminates the workload, deletes the durable volume and releases every snapshot (full purge). The chat recreates a fresh sandbox on its next message.">Purge</button>
+    </span></div></div>`;
+}
+async function refresh() {
+  const res = await api('/_trident/console/actors/api/state');
+  if (res.status === 401) { $('list').innerHTML = '<div class="empty">save the console token above</div>'; return; }
+  const s = await res.json();
+  $('list').innerHTML = s.actors?.length ? s.actors.map(card).join('') : '<div class="empty">no actors</div>';
+}
+async function act(name, action) {
+  if (!confirm(action === 'delete' ? `Purge ${name}? Everything is destroyed and released: the running workload, its durable volume (files, agent credentials) and ALL of its snapshots. The chat starts a fresh sandbox on its next message.` : `Suspend ${name}?`)) return;
+  const res = await api('/_trident/console/actors/api/actor', {
+    method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+    body: JSON.stringify({name, action})});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
+refreshTokUI();
+refresh(); setInterval(refresh, 10000);
+</script>
+</body>
+</html>

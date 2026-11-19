@@ -1,0 +1,111 @@
+# RBAC for trident (rendered by scripts/deploy.sh with the substrate system
+# namespace; defaults below assume ate-system).
+#
+# The namespace must also carry the label the substrate network policies use to
+# admit ateapi clients (docs: ate-system NetworkPolicy allows API clients from
+# namespaces labeled ate.dev/api-access=true).
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trident
+  namespace: ${TRI_NAMESPACE}
+
+---
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trident-api-key
+  namespace: ${TRI_NAMESPACE}
+type: Opaque
+stringData:
+  api-key: "${TRI_API_KEY}"
+
+---
+
+# Token minting for the ateapi control-plane identity the shim authenticates
+# with (mirrors the ate-client flow in internal/ateclient).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trident-ateapi-token
+  namespace: ${ATE_SYSTEM_NAMESPACE}
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  resourceNames: ["ate-client"]
+  verbs: ["create"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trident-ateapi-token
+  namespace: ${ATE_SYSTEM_NAMESPACE}
+subjects:
+- kind: ServiceAccount
+  name: trident
+  namespace: ${TRI_NAMESPACE}
+roleRef:
+  kind: Role
+  name: trident-ateapi-token
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+# Router client certificate minting (PodCertificateRequest for the
+# atenet-client identity the ingress allowlist accepts).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trident-podcert
+  namespace: ${ATE_SYSTEM_NAMESPACE}
+rules:
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["podcertificaterequests"]
+  verbs: ["create", "get", "delete"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trident-podcert
+  namespace: ${ATE_SYSTEM_NAMESPACE}
+subjects:
+- kind: ServiceAccount
+  name: trident
+  namespace: ${TRI_NAMESPACE}
+roleRef:
+  kind: Role
+  name: trident-podcert
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+# ClusterTrustBundle reads (verifying Service serving certs).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trident-ctb
+rules:
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["clustertrustbundles"]
+  verbs: ["get", "list"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trident-ctb
+subjects:
+- kind: ServiceAccount
+  name: trident
+  namespace: ${TRI_NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: trident-ctb
+  apiGroup: rbac.authorization.k8s.io

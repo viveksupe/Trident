@@ -1,0 +1,330 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trident · egress approvals</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #2a3139; --text: #e6edf3;
+    --muted: #8b949e; --accent: #2f81f7; --warn: #d29922; --bad: #f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f6f8fa; --panel: #ffffff; --line: #d0d7de; --text: #1f2328; --muted: #656d76; --accent: #0969da; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 16px; }
+  input, select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  input[type="password"], input[list] { color: var(--text); }
+  input[type="password"]::placeholder { color: #6a737d; }
+  input[list]::placeholder { color: #6a737d; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; font-weight: 500; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button.deny { background: var(--bad); }
+  button.revoke { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 10px 0; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .host { font-weight: 600; }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+  .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .badge { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font-size: 11px; color: var(--muted); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 28px 0 8px; }
+  .empty { color: var(--muted); font-style: italic; }
+  nav { display: flex; gap: 8px; margin-bottom: 18px; }
+  nav a { color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; text-decoration: none; }
+  nav a.on { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<script>window.__defaultToken = /*DEFAULT_TOKEN_INJECT*/"";</script>
+
+<!-- token settings: top-right key button -->
+<div id="tokwidget" style="position:fixed;top:14px;right:14px;z-index:10;">
+  <button id="tokbtn" title="console token settings" onclick="toggleTokPanel()" style="background:var(--panel);border:1px solid var(--line);border-radius:999px;width:40px;height:40px;cursor:pointer;position:relative;color:var(--text);">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="8" r="5"/><path d="M12 12l9 9M17 17l2-2M19.5 14.5l2-2"/></svg>
+    <span id="tokdot" style="position:absolute;top:-2px;right:-2px;width:10px;height:10px;border-radius:50%;background:var(--bad);display:none;"></span>
+  </button>
+  <div id="tokpanel" style="display:none;position:absolute;top:46px;right:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;min-width:260px;box-shadow:0 8px 24px rgba(0,0,0,.35);">
+    <div style="color:var(--muted);font-size:12px;margin-bottom:6px;">Console token</div>
+    <input id="tok2" type="password" placeholder="console token" style="width:100%;margin-bottom:8px;box-sizing:border-box;color:var(--text);">
+    <div style="display:flex;gap:8px;">
+      <button style="padding:6px 12px;" onclick="saveTokPanel()">Save</button>
+      <button class="ghost" style="padding:6px 12px;" onclick="clearTokPanel()">Clear</button>
+    </div>
+    <div id="tokstate" style="color:var(--muted);font-size:11px;margin-top:8px;"></div>
+  </div>
+</div>
+<script>
+function toggleTokPanel() {
+  const p = document.getElementById('tokpanel');
+  p.style.display = (p.style.display === 'none') ? 'block' : 'none';
+  refreshTokUI();
+}
+function refreshTokUI() {
+  const saved = localStorage.getItem('ots-console-token');
+  const dot = document.getElementById('tokdot');
+  const inp = document.getElementById('tok2');
+  const st = document.getElementById('tokstate');
+  if (inp) { if (!saved) { inp.value = window.__defaultToken || ''; inp.type = 'text'; } else { inp.type = 'password'; inp.value = saved; } }
+  if (dot) dot.style.display = saved ? 'none' : 'block';
+  if (st) st.textContent = saved ? 'token saved in this browser' : (window.__defaultToken ? 'using the default token (not saved yet)' : 'no token set');
+}
+function saveTokPanel() {
+  const v = document.getElementById('tok2').value.trim();
+  if (v) localStorage.setItem('ots-console-token', v);
+  document.getElementById('tokpanel').style.display = 'none';
+  if (typeof refresh === 'function') refresh();
+}
+function clearTokPanel() { localStorage.removeItem('ots-console-token'); refreshTokUI(); if (typeof refresh === 'function') refresh(); }
+</script>
+
+<main>
+  <nav>
+    <a class="on" href="/_trident/console/egress">Egress approvals</a>
+    <a href="/_trident/console/actors">Sandbox actors</a>
+  </nav>
+  <h1>Egress approvals</h1>
+  <div class="sub">Blocked attempts from each chat's sandbox appear here. Approval opens exactly TCP 443 (TLS) and 80 (HTTP) for that actor.</div>
+  <div id="msg" style="color:var(--warn);min-height:18px;margin-bottom:6px;"></div>
+
+  <h2>Pending requests</h2>
+  <div id="pending-header" class="row" style="margin-bottom:8px;display:none;">
+    <select id="all-ttl" title="how long the rules stay open">
+      <option value="2h" selected>2 hours</option>
+      <option value="30m">30 minutes</option>
+      <option value="24h">24 hours</option>
+      <option value="7d">7 days</option>
+      <option value="permanent">permanent</option>
+    </select>
+    <button onclick="approveAll(document.getElementById('all-ttl').value)">Approve all</button>
+  </div>
+  <div id="pending"><div class="empty">none</div></div>
+
+  <h2>Live grants</h2>
+  <div id="live-header" class="row" style="margin-bottom:8px;display:none;">
+    <button class="revoke" onclick="revokeAll()">Revoke all</button>
+  </div>
+  <div id="live"><div class="empty">none</div></div>
+
+  <h2>Decided</h2>
+  <div class="row" style="margin-bottom:8px;">
+    <button class="ghost" onclick="clearHistory()">Clear decided history (revokes its egress rules)</button>
+  </div>
+  <div id="history"><div class="empty">none</div></div>
+
+  <h2>Auto-approve actors</h2>
+  <div class="sub">Requests from these actors approve themselves with the rule's TTL.</div>
+  <form class="row" style="gap:8px;margin:8px 0;" onsubmit="addAuto(); return false;">
+    <select id="auto-actor-select" style="min-width:280px;">
+      <option value="">pick an actor…</option>
+    </select>
+    <input id="auto-actor" placeholder="type an actor name manually…" style="min-width:260px;display:none;">
+    <button class="ghost" type="button" onclick="toggleManual(this)" title="type a name manually">⌨</button>
+    <select id="auto-ttl" title="TTL of each grant">
+      <option value="2h" selected>2 hours</option>
+      <option value="30m">30 minutes</option>
+      <option value="24h">24 hours</option>
+      <option value="7d">7 days</option>
+      <option value="permanent">permanent</option>
+    </select>
+    <button>Enable auto-approve</button>
+  </form>
+  <div id="autos"><div class="empty">none</div></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let manualMode = false;
+function toggleManual(btn) {
+  manualMode = !manualMode;
+  document.getElementById('auto-actor-select').style.display = manualMode ? 'none' : '';
+  document.getElementById('auto-actor').style.display = manualMode ? '' : 'none';
+  btn.textContent = manualMode ? '▾' : '⌨';
+}
+function chosenActor() {
+  return manualMode ? document.getElementById('auto-actor').value.trim()
+                    : document.getElementById('auto-actor-select').value;
+}
+const auth = () => ({'Authorization': 'Bearer ' + localStorage.getItem('ots-console-token')});
+async function api(path, opts) { return fetch(path, {headers: auth(), ...opts}); }
+function esc(s) { return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmt(t) { return t ? new Date(t).toLocaleString() : ''; }
+function humanLeft(iso) {
+  const left = new Date(iso) - Date.now();
+  if (isNaN(left)) return '';
+  if (left <= 0) return 'expired';
+  const h = Math.floor(left / 3600000), m = Math.round((left % 3600000) / 60000);
+  return 'expires in ' + (h ? h + 'h ' + m + 'm' : m + 'm');
+}
+function humanTTL(sec) {
+  if (!sec || sec <= 0) return 'permanent';
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.round((sec % 3600) / 60);
+  return 'each grant ' + (d ? d + 'd' + (h ? h + 'h' : '') : h ? h + 'h' + (m ? m + 'm' : '') : m + 'm');
+}
+function requestCard(r, autos) {
+  const isAuto = (autos || []).some(a => a.actor_name === r.actor_name);
+  const needsName = !r.host;
+  const nameInput = needsName
+    ? `<input id="hostname-${r.id}" placeholder="hostname to allow (e.g. google.com)" style="min-width:200px;">`
+    : '';
+  return `<div class="card"><div class="row">
+    ${needsName ? `<span class="host" style="color:var(--warn)">unknown host (${esc((r.reason||'').replace('blocked egress to ', '').replace(' (observed in gateway logs)', ''))})</span>` : `<span class="host">${esc(r.host)}</span>`}
+    ${nameInput}
+    <span class="mono">actor ${esc(r.actor_name)}</span>
+    ${r.reason ? `<span class="mono">"${esc(r.reason)}"</span>` : ''}
+    <span class="badge">requested ${fmt(r.created)}</span>
+    ${isAuto ? '<span class="badge" style="color:var(--accent)">auto</span>' : ''}
+    <span class="actions">
+      <select id="ttl-${r.id}" title="how long the rule stays open">
+        <option value="2h" selected>2 hours</option>
+        <option value="30m">30 minutes</option>
+        <option value="24h">24 hours</option>
+        <option value="7d">7 days</option>
+        <option value="permanent">permanent</option>
+      </select>
+      <button onclick="decide(${r.id}, 'approve')">Approve</button>
+      <button class="ghost" onclick="autoAndApprove('${esc(r.actor_name)}', ${r.id})" title="Enable auto-approve for this actor (with the TTL box) and approve this + its other pending requests">Auto + approve</button>
+      <button class="deny" onclick="decide(${r.id}, 'deny')">Deny</button>
+    </span></div></div>`;
+}
+function grantCard(g) {
+  const exp = g.expires ? humanLeft(g.expires) : 'permanent';
+  const expired = exp === 'expired';
+  return `<div class="card"><div class="row">
+    <span class="host" style="${expired ? 'color:var(--muted);text-decoration:line-through' : ''}">${esc(g.host)}</span>
+    <span class="mono">actor ${esc(g.actor_name)}</span>
+    <span class="badge" style="${expired ? 'color:var(--warn)' : ''}">${exp}</span>
+    <span class="actions"><button class="revoke" onclick="revoke(${g.id})">Revoke</button></span>
+  </div></div>`;
+}
+function autoCard(a) {
+  return `<div class="card"><div class="row">
+    <span class="host">${esc(a.actor_name)}</span>
+    <span class="badge">${humanTTL(a.ttl_seconds)}</span>
+    <span class="actions"><button class="revoke" onclick="clearAuto('${esc(a.actor_name)}')">Disable</button></span>
+  </div></div>`;
+}
+function histCard(r) { return `<div class="card"><div class="row">
+    <span class="host">${esc(r.host)}</span><span class="mono">actor ${esc(r.actor_name)}</span>
+    <span class="badge">${esc(r.status)}</span><span class="badge">decided ${fmt(r.decided)}</span>
+  </div></div>`; }
+
+let pollTimer = null;
+function schedule() {
+  clearTimeout(pollTimer);
+  const busy = ($('pending').querySelector('.card') !== null) ||
+               ($('live').querySelector('.card') !== null);
+  pollTimer = setTimeout(refresh, busy ? 2000 : 15000);
+}
+async function refresh() {
+  try {
+    const res = await api('/_trident/console/egress/api/state');
+    if (res.status === 401) {
+      $('msg').textContent = 'Save your console token (key button, top right).';
+      document.title = 'Trident · token needed';
+      schedule();
+      return;
+    }
+    $('msg').textContent = '';
+    document.title = 'Trident · egress approvals';
+    const s = await res.json();
+    window.__autos = s.autos || [];
+    $('pending').innerHTML = s.pending?.length ? s.pending.map(r => requestCard(r, window.__autos)).join('') : '<div class="empty">none</div>';
+    $('live').innerHTML = s.live?.length ? s.live.map(grantCard).join('') : '<div class="empty">none</div>';
+    $('live-header').style.display = s.live?.length ? '' : 'none';
+    $('history').innerHTML = s.history?.length ? s.history.map(histCard).join('') : '<div class="empty">none</div>';
+    $('autos').innerHTML = s.autos?.length ? s.autos.map(autoCard).join('') : '<div class="empty">none</div>';
+    $('pending-header').style.display = s.pending?.length ? '' : 'none';
+    const actsResp = await api('/_trident/console/actors/api/state');
+    const byName = {};
+    if (actsResp.ok) {
+      const al = (await actsResp.json()).actors || [];
+      for (const a of al) byName[a.name] = a;
+      const names = Object.keys(byName).sort();
+      const sig = names.map(n => n + '|' + (byName[n].state || '')).join(';');
+      if (sig !== (window.__actorSig || '')) {
+        window.__actorSig = sig;
+        const sel = document.getElementById('auto-actor-select');
+        const current = sel.value;
+        sel.innerHTML = '<option value="">pick an actor…</option>' + names.map(n =>
+          `<option value="${esc(n)}">${esc(n)}${byName[n].state ? ' · ' + esc(byName[n].state.replace('ACTOR_STATE_', '').toLowerCase()) : ''}${byName[n].template ? ' · ' + esc(byName[n].template) : ''}</option>`).join('');
+        if (current && names.includes(current)) sel.value = current;
+      }
+    }
+  } catch (e) {}
+  schedule();
+}
+async function decide(id, action) {
+  const body = action === 'approve' ? {ttl: document.getElementById('ttl-' + id)?.value ?? ''} : {};
+  const hostEl = document.getElementById('hostname-' + id);
+  if (hostEl) body.hostname = hostEl.value.trim();
+  const res = await api('/_trident/console/egress/api/request/' + id + '/' + action,
+    {method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
+async function revoke(id) {
+  const res = await api('/_trident/console/egress/api/grant/' + id + '/revoke', {method: 'POST'});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
+async function revokeAll() {
+  if (!confirm('Revoke every live egress grant?')) return;
+  const res = await api('/_trident/console/egress/api/grants/revoke-all', {method: 'POST'});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
+async function clearHistory() {
+  if (!confirm('Revoke all egress rules from decided requests and clear the history?')) return;
+  const res = await api('/_trident/console/egress/api/history/clear', {method: 'POST'});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
+async function autoAndApprove(actor, requestId) {
+  const ttl = document.getElementById('ttl-' + requestId)?.value ?? 'permanent';
+  const res = await api('/_trident/console/egress/api/auto', {
+    method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+    body: JSON.stringify({actor, ttl: ttl || 'permanent'})});
+  if (!res.ok) { alert((await res.json()).detail || 'failed'); return; }
+  const st = await api('/_trident/console/egress/api/state');
+  if (!st.ok) return refresh();
+  const s2 = await st.json();
+  for (const p of (s2.pending || []).filter(pp => pp.actor_name === actor)) {
+    await api('/_trident/console/egress/api/request/' + p.id + '/approve', {
+      method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+      body: JSON.stringify({ttl})});
+  }
+  refresh();
+}
+async function approveAll(ttl) {
+  const st = await api('/_trident/console/egress/api/state');
+  if (!st.ok) return;
+  const s = await st.json();
+  for (const p of (s.pending || []).filter(p => p.host)) {
+    await api('/_trident/console/egress/api/request/' + p.id + '/approve', {
+      method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+      body: JSON.stringify({ttl})});
+  }
+  refresh();
+}
+async function addAuto() {
+  const actor = chosenActor();
+  const ttlInput = document.getElementById('auto-ttl').value;
+  if (!actor) return;
+  const res = await api('/_trident/console/egress/api/auto', {
+    method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+    body: JSON.stringify({actor, ttl: ttlInput})});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
+async function clearAuto(actor) {
+  const res = await api('/_trident/console/egress/api/auto/' + encodeURIComponent(actor), {method: 'DELETE'});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
+refreshTokUI();
+refresh();
+</script>
+</body>
+</html>

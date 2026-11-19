@@ -1,0 +1,71 @@
+# ActorTemplate (protojson-shaped ateapi.ActorTemplate) for an Open Terminal
+# actor. Embedded into the trident binary and rendered by
+# `trident bootstrap -image repo@sha256:...` (placeholders ${...} below).
+#
+# The actor runs the real open-terminal server (pip-installed in
+# images/actor) on TRI_ACTOR_PORT (default 8000), reachable only through
+# atenet-router's CONNECT tunnels; the wakeup probe gates ResumeActor.
+metadata:
+  atespace: ${ATESPACE}
+  name: ${TEMPLATE_NAME}
+workerSelector:
+  matchLabels:
+    workload: ot-terminal
+containers:
+- name: open-terminal
+  image: ${WORKLOAD_IMAGE}
+  env:
+  - name: OPEN_TERMINAL_API_KEY
+    value: "${TRI_API_KEY}"
+  - name: ENABLE_TERMINAL
+    value: "${ENABLE_TERMINAL}"
+  - name: ENABLE_NOTEBOOKS
+    value: "${ENABLE_NOTEBOOKS}"
+  - name: ENABLE_SYSTEM_PROMPT
+    value: "${ENABLE_SYSTEM_PROMPT}"
+  - name: ENABLE_BROWSER
+    value: "${ENABLE_BROWSER}"
+  - name: ENABLE_DESKTOP
+    value: "${ENABLE_DESKTOP}"
+  - name: MULTI_USER
+    value: "false"
+  - name: ANTHROPIC_API_KEY
+    value: "${ANTHROPIC_API_KEY}"
+  - name: OPENAI_API_KEY
+    value: "${OPENAI_API_KEY}"
+  - name: DISABLE_AUTOUPDATER
+    value: "1"
+  - name: TRI_EGRESS_CALLBACK
+    value: "${EGRESS_CALLBACK}"
+  wakeupProbe:
+    httpGet:
+      path: /health
+      port: ${ACTOR_PORT}
+    timeoutSeconds: 180
+  volumeMounts:
+  - name: home
+    mountPath: /home/user
+  - name: meta
+    mountPath: /mnt/ots
+# Sandbox size: the open-terminal python server plus one Node-based agent CLI
+# at a time run several hundred MB and spike while tools run.
+resources:
+  limits:
+    cpuMillicores: ${CPU_MILLICORES}
+    memoryBytes: ${MEMORY_BYTES}
+snapshotConfig:
+  # MEMORY fidelity captures the process tree and RAM, so an idle actor
+  # holding a coding-agent session suspends and resumes mid-conversation.
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
+volumes:
+- name: home
+  durableDir: {}
+- name: meta
+  systemInfo:
+    dataSources:
+    - actorMetadata:
+        items:
+        - field: ACTOR_METADATA_FIELD_NAME
+          path: name
+        - field: ACTOR_METADATA_FIELD_ATESPACE
+          path: atespace

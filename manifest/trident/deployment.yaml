@@ -1,0 +1,98 @@
+# trident Deployment + Service (in-cluster variant).
+# Rendered by scripts/deploy.sh (values substituted), or applied as-is with a
+# ConfigMap/env approach. The shim needs the RBAC in sa-rbac.yaml.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trident
+  namespace: ${TRI_NAMESPACE}
+  labels:
+    app: trident
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trident
+  strategy:
+    type: Recreate # the sqlite session map is a local State at /var/lib/trident
+  template:
+    metadata:
+      labels:
+        app: trident
+    spec:
+      serviceAccountName: trident
+      containers:
+      - name: trident
+        image: ${TRI_IMAGE}
+        args: ["serve"]
+        env:
+        - name: TRI_LISTEN_ADDR
+          value: "0.0.0.0:8080"
+        - name: TRI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: trident
+              key: api-key
+        - name: TRI_BACKEND
+          value: "substrate"
+        - name: TRI_STATE_DB
+          value: "/var/lib/trident/sessionmap.db"
+        - name: TRI_ATESPACE
+          value: "${ATESPACE}"
+        - name: TRI_TEMPLATE_REF
+          value: "${ATESPACE}/open-terminal"
+        - name: TRI_ACTOR_PREFIX
+          value: "ot-"
+        - name: TRI_ACTOR_PORT
+          value: "${ACTOR_PORT}"
+        - name: TRI_IDLE_TTL
+          value: "${IDLE_TTL}"
+        - name: TRI_MAX_AGE
+          value: "${MAX_AGE}"
+        - name: TRI_FEATURES_JSON
+          value: "${FEATURES_JSON}"
+        - name: TRI_EGRESS_HOSTS
+          value: "${EGRESS_HOSTS}"
+        - name: ATE_NAMESPACE
+          value: "${ATE_SYSTEM_NAMESPACE}"
+        ports:
+        - name: http
+          containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+        volumeMounts:
+        - name: state
+          mountPath: /var/lib/trident
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: "1"
+            memory: 512Mi
+      volumes:
+      - name: state
+        emptyDir:
+          sizeLimit: 256Mi
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: trident
+  namespace: ${TRI_NAMESPACE}
+spec:
+  selector:
+    app: trident
+  ports:
+  - name: http
+    port: 80
+    targetPort: http

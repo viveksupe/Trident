@@ -1,0 +1,93 @@
+// Console "Sandbox actors" panel: list/inspect + delete + suspend actors
+// (manual cleanup).
+package facade
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"github.com/viveksupe/Trident/internal/backend"
+)
+
+type actorView struct {
+	Name     string `json:"name"`
+	State    string `json:"state"`
+	Template string `json:"template"`
+	Created  string `json:"created,omitempty"`
+}
+
+// actorsState lists the backend's actors (name + template).
+func (s *Server) actorsState(w http.ResponseWriter, r *http.Request) {
+	if !s.consoleAuthed(w, r) {
+		return
+	}
+	if s.backend == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"actors": []actorView{}})
+		return
+	}
+	hs, err := s.backend.ListReady(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, detail{err.Error()})
+		return
+	}
+	out := make([]actorView, 0, len(hs))
+	for _, h := range hs {
+		v := actorView{Name: h.Name}
+		if a, ok := s.backend.(interface {
+			ActorDetails(ctx context.Context, name string) (state, template, created string)
+		}); ok {
+			v.State, v.Template, v.Created = a.ActorDetails(r.Context(), h.Name)
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"actors": out})
+}
+
+// actorsDelete destroys (or suspends) one actor by name.
+func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
+	if !s.consoleAuthed(w, r) {
+		return
+	}
+	var body struct {
+		Name   string `json:"name"`
+		Action string `json:"action"` // delete | suspend
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+		writeJSON(w, http.StatusBadRequest, detail{"name is required"})
+		return
+	}
+	body.Action = orDefault(body.Action, "delete")
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	h := &backend.Handle{Name: body.Name}
+	var err error
+	switch body.Action {
+	case "suspend":
+		err = s.backend.Suspend(ctx, h)
+	case "delete":
+		err = s.backend.Delete(ctx, h) // also drops its egress rules implicitly
+	default:
+		writeJSON(w, http.StatusBadRequest, detail{"action must be delete|suspend"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, detail{err.Error()})
+		return
+	}
+	if body.Action == "delete" && s.pl != nil {
+		s.pl.ForgetByActorName(body.Name)
+	}
+	// substrate releases the actor's snapshots and durable volume on delete
+	// (the actor is the sole owner of both); the egress policy is nested
+	// under the actor and goes with it.
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted (state + snapshots purged)"})
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
