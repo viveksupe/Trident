@@ -191,11 +191,15 @@ function requestCard(r, autos) {
 function grantCard(g) {
   const exp = g.expires ? humanLeft(g.expires) : 'permanent';
   const expired = exp === 'expired';
+  const wild = g.host === '*';
+  const hostLabel = wild
+    ? '<span class="host" style="color:var(--warn)">🌐 FULL INTERNET (all 443/80)</span>'
+    : `<span class="host">${esc(g.host)}</span>`;
   return `<div class="card"><div class="row">
-    <span class="host" style="${expired ? 'color:var(--muted);text-decoration:line-through' : ''}">${esc(g.host)}</span>
+    ${hostLabel} style="${expired ? 'color:var(--muted);text-decoration:line-through' : ''}">${esc(g.host)}</span>
     <span class="mono">actor ${esc(g.actor_name)}</span>
     <span class="badge" style="${expired ? 'color:var(--warn)' : ''}">${exp}</span>
-    <span class="actions"><button class="revoke" onclick="revoke(${g.id})">Revoke</button></span>
+    <span class="actions"><button class="revoke" onclick="revoke(${g.id})">${wild ? 'Revoke wildcard' : 'Revoke'}</button></span>
   </div></div>`;
 }
 function autoCard(a) {

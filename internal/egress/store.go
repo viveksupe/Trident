@@ -100,6 +100,47 @@ func (s *Store) InsertRequest(r *Request) error {
 	return err
 }
 
+// GrantForWild returns the live wildcard grant for actor, if any.
+func (s *Store) GrantForWild(actor, host string) (*Grant, error) {
+	rows, err := s.db.Query(`SELECT id,request_id,atespace,actor_name,host,granted,expires,revoked
+		FROM egress_grants WHERE actor_name=? AND host=? AND revoked=0 ORDER BY id DESC LIMIT 1`, actor, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, nil
+	}
+	var g Grant
+	var granted, expires, revoked int64
+	if err := rows.Scan(&g.ID, &g.RequestID, &g.Atespace, &g.ActorName, &g.Host, &granted, &expires, &revoked); err != nil {
+		return nil, err
+	}
+	g.Granted, g.Expires = time.Unix(0, granted), time.Unix(0, expires)
+	if revoked != 0 {
+		g.Revoked = time.Unix(0, revoked)
+	}
+	return &g, nil
+}
+
+// InsertWildGrant records a wildcard grant (no originating request).
+func (s *Store) InsertWildGrant(atespace, actor, host string, ttl time.Duration) error {
+	expires := int64(0)
+	if ttl > 0 {
+		expires = time.Now().Add(ttl).UnixNano()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO egress_grants(request_id,atespace,actor_name,host,granted,expires) VALUES(0,?,?,?,?,?)`,
+		atespace, actor, host, time.Now().UnixNano(), expires)
+	return err
+}
+
+// SetWildTTL narrows a wildcard grant's expiry.
+func (s *Store) SetWildTTL(id int64, expires time.Time) error {
+	_, err := s.db.Exec(`UPDATE egress_grants SET expires=? WHERE id=?`, expires.UnixNano(), id)
+	return err
+}
+
 // PendingPaged returns one page of pending requests (oldest first) and the
 // total count.
 func (s *Store) PendingPaged(limit, offset int) ([]Request, int, error) {

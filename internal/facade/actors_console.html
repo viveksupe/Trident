@@ -101,6 +101,16 @@ async function refresh() {
   const s = await res.json();
   $('list').innerHTML = s.actors?.length ? s.actors.map(card).join('') : '<div class="empty">no actors</div>';
 }
+async function fullInternet(name) {
+  if (!confirm('FULL INTERNET for ' + name + '?\n\nEvery https (443) and http (80) destination becomes reachable — including anything in the environment that holds credentials. Choose a TTL:')) return;
+  const ttl = prompt('Grant TTL (45m, 2h, 1d, permanent):', '2h');
+  if (!ttl) return;
+  const res = await fetch('/_trident/console/actors/api/actor', {
+    method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+    body: JSON.stringify({name, action: 'internet', ttl})});
+  if (!res.ok) alert((await res.json()).detail || 'failed');
+  refresh();
+}
 async function act(name, action) {
   if (!confirm(action === 'delete' ? `Purge ${name}? Everything is destroyed and released: the running workload, its durable volume (files, agent credentials) and ALL of its snapshots. The chat starts a fresh sandbox on its next message.` : `Suspend ${name}?`)) return;
   const res = await api('/_trident/console/actors/api/actor', {

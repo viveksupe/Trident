@@ -52,7 +52,8 @@ func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Name   string `json:"name"`
-		Action string `json:"action"` // delete | suspend
+		Action string `json:"action"` // delete | suspend | internet
+		TTL    string `json:"ttl"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
 		writeJSON(w, http.StatusBadRequest, detail{"name is required"})
@@ -66,10 +67,30 @@ func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
 	switch body.Action {
 	case "suspend":
 		err = s.backend.Suspend(ctx, h)
+		if err == nil {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "suspended"})
+			return
+		}
+	case "internet":
+		if s.egress == nil {
+			writeJSON(w, http.StatusBadRequest, detail{"egress flow disabled"})
+			return
+		}
+		ttl, terr := parseTTL(body.TTL, true)
+		if terr != nil {
+			writeJSON(w, http.StatusBadRequest, detail{"bad ttl: " + terr.Error()})
+			return
+		}
+		if terr = s.egress.GrantFullInternet(ctx, "ots-webui", body.Name, ttl); terr != nil {
+			writeJSON(w, http.StatusInternalServerError, detail{terr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "full internet granted"})
+		return
 	case "delete":
 		err = s.backend.Delete(ctx, h) // also drops its egress rules implicitly
 	default:
-		writeJSON(w, http.StatusBadRequest, detail{"action must be delete|suspend"})
+		writeJSON(w, http.StatusBadRequest, detail{"action must be delete|suspend|internet"})
 		return
 	}
 	if err != nil {

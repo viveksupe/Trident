@@ -155,6 +155,71 @@ func (m *Manager) Deny(requestID int64) error {
 	return nil
 }
 
+// FullInternetHost is the wildcard grant marker: a tls-passthrough rule for
+// "*" (every TLS name) on 443 plus a cleartext http rule for "*" on 80.
+const FullInternetHost = "*"
+
+// fullInternetRules are the two rules that open the whole public web.
+func fullInternetRules() []*ateapi.EgressRule {
+	return []*ateapi.EgressRule{
+		{
+			TlsPassthrough: &ateapi.TlsPassthroughRule{
+				Hostnames: []string{FullInternetHost},
+				Ports:     &ateapi.Ports{Numbers: []int32{443}},
+			},
+		},
+		{
+			Http: &ateapi.HttpRule{
+				Hostnames: []string{FullInternetHost},
+				Ports:     &ateapi.Ports{Numbers: []int32{80}},
+			},
+		},
+	}
+}
+
+// hasFullInternet reports that the policy already opens everything.
+func hasFullInternet(pol *ateapi.EgressPolicy) bool {
+	for _, r := range pol.Rules {
+		if tp := r.GetTlsPassthrough(); tp != nil {
+			if containsHostname(tp.GetHostnames(), FullInternetHost) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// GrantFullInternet opens the full public web (TLS 443 + HTTP 80 for every
+// hostname) for one actor and records the grant so the console shows and can
+// revoke it. Deliberate escalation: logged loudly.
+func (m *Manager) GrantFullInternet(ctx context.Context, atespace, actor string, ttl time.Duration) error {
+	pol, err := m.lc.GetEgressPolicy(ctx, atespace, actor)
+	if err != nil {
+		return err
+	}
+	if pol == nil {
+		return fmt.Errorf("actor %s/%s has no egress policy", atespace, actor)
+	}
+	if !hasFullInternet(pol) {
+		pol.Rules = append(pol.Rules, fullInternetRules()...)
+		if err := m.lc.UpdateEgressPolicy(ctx, atespace, actor, pol); err != nil {
+			return err
+		}
+	}
+	// Record the grant so the console shows it and can revoke it.
+	if existing, err := m.store.GrantForWild(actor, FullInternetHost); err != nil || existing == nil || existing.ID == 0 {
+		if err2 := m.store.InsertWildGrant(atespace, actor, FullInternetHost, ttl); err2 != nil {
+			return err2
+		}
+	} else if ttl > 0 {
+		if err := m.store.SetWildTTL(existing.ID, time.Now().Add(ttl)); err != nil {
+			return err
+		}
+	}
+	m.log.Warn("egress FULL INTERNET granted (wildcard *)", "actor", actor, "ttl", ttl)
+	return nil
+}
+
 // PurgeActor drops all bookkeeping for a deleted actor. The substrate egress
 // policy does not need patching: it is nested under the actor and destroyed
 // with it.
