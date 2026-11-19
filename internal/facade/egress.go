@@ -83,9 +83,25 @@ func (s *Server) RegisterEgress(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_ots/egress/request/{id}", s.egressRequestStatus)
 
 	// Human console: Bearer-token (LAN-reachable by design).
-	mux.HandleFunc("GET /_trident/console/egress", func(w http.ResponseWriter, r *http.Request) {
-		s.writeConsolePage(w, egressConsoleHTML)
-	})
+	// Compat: pre-rename console bookmarks keep working.
+	for _, legacy := range []struct{ from, to string }{
+		{"/_ots/console/egress", "/_trident/console/egress"},
+		{"/_ots/console/actors", "/_trident/console/actors"},
+	} {
+		mux.HandleFunc("GET "+legacy.from, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, strings.Replace(r.URL.Path, "/_ots/console", "/_trident/console", 1), http.StatusFound)
+		})
+		to := legacy.to
+		page := egressConsoleHTML
+		if strings.HasSuffix(to, "actors") {
+			page = actorsConsoleHTML
+		}
+		handlerTo := to
+		mux.HandleFunc("GET "+handlerTo, func(w http.ResponseWriter, r *http.Request) {
+			s.writeConsolePage(w, page)
+		})
+	}
+
 	mux.HandleFunc("GET /_trident/console/egress/api/state", s.egressState)
 	mux.HandleFunc("POST /_trident/console/egress/api/request/{id}/approve", s.decideHandler(true))
 	mux.HandleFunc("POST /_trident/console/egress/api/request/{id}/deny", s.decideHandler(false))
@@ -95,9 +111,7 @@ func (s *Server) RegisterEgress(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_trident/console/egress/api/grants/revoke-all", s.egressRevokeAll)
 	mux.HandleFunc("POST /_trident/console/egress/api/history/clear", s.egressClearHistory)
 	// Sandbox actor maintenance (cleanup).
-	mux.HandleFunc("GET /_trident/console/actors", func(w http.ResponseWriter, r *http.Request) {
-		s.writeConsolePage(w, actorsConsoleHTML)
-	})
+
 	mux.HandleFunc("GET /_trident/console/actors/api/state", s.actorsState)
 	mux.HandleFunc("POST /_trident/console/actors/api/actor", s.actorsDelete)
 
