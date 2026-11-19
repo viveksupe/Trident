@@ -92,6 +92,7 @@ function card(a) {
     ${a.created ? `<span class="badge">created ${esc(a.created)}</span>` : ''}
     <span class="row" style="margin-left:auto">
       <button class="suspend" onclick="act('${esc(a.name)}','suspend')">Suspend</button>
+      <button class="ghost" style="color:var(--warn);border-color:var(--warn);" onclick="fullInternet('${esc(a.name)}')" title="Open ALL destinations on ALL ports (TLS anywhere + cleartext HTTP) for this actor. Removes zero-trust path filtering until revoked or expired.">🌐 Full internet</button>
       <button class="revoke" onclick="act('${esc(a.name)}','delete')" title="Terminates the workload, deletes the durable volume and releases every snapshot (full purge). The chat recreates a fresh sandbox on its next message.">Purge</button>
     </span></div></div>`;
 }

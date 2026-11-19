@@ -159,19 +159,17 @@ func (m *Manager) Deny(requestID int64) error {
 // "*" (every TLS name) on 443 plus a cleartext http rule for "*" on 80.
 const FullInternetHost = "*"
 
-// fullInternetRules are the two rules that open the whole public web.
+// fullInternetRules opens TLS passthrough to every name on every port.
+// Substrate rejects a cleartext-HTTP rule that ties with the TLS-all-ports
+// rule (both could claim port 80), so cleartext HTTP to non-approved hosts
+// stays unavailable; TLS covers https and any TLS-flavoured protocol on any
+// port. Non-TCP and server-speaks-first protocols remain unreachable.
 func fullInternetRules() []*ateapi.EgressRule {
 	return []*ateapi.EgressRule{
 		{
 			TlsPassthrough: &ateapi.TlsPassthroughRule{
 				Hostnames: []string{FullInternetHost},
-				Ports:     &ateapi.Ports{Numbers: []int32{443}},
-			},
-		},
-		{
-			Http: &ateapi.HttpRule{
-				Hostnames: []string{FullInternetHost},
-				Ports:     &ateapi.Ports{Numbers: []int32{80}},
+				Ports:     &ateapi.Ports{All: &ateapi.AllPorts{}},
 			},
 		},
 	}
@@ -189,6 +187,19 @@ func hasFullInternet(pol *ateapi.EgressPolicy) bool {
 	return false
 }
 
+// hasAllPortWildcard reports that the wildcard rules already cover every
+// port (vs the legacy 443/80 pair).
+func hasAllPortWildcard(pol *ateapi.EgressPolicy) bool {
+	for _, r := range pol.Rules {
+		if tp := r.GetTlsPassthrough(); tp != nil &&
+			containsHostname(tp.GetHostnames(), FullInternetHost) &&
+			tp.GetPorts().GetAll() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // GrantFullInternet opens the full public web (TLS 443 + HTTP 80 for every
 // hostname) for one actor and records the grant so the console shows and can
 // revoke it. Deliberate escalation: logged loudly.
@@ -200,8 +211,20 @@ func (m *Manager) GrantFullInternet(ctx context.Context, atespace, actor string,
 	if pol == nil {
 		return fmt.Errorf("actor %s/%s has no egress policy", atespace, actor)
 	}
-	if !hasFullInternet(pol) {
-		pol.Rules = append(pol.Rules, fullInternetRules()...)
+	if !hasFullInternet(pol) || !hasAllPortWildcard(pol) {
+		// New grant, or a legacy 443/80 wildcard: rewrite as the all-ports
+		// wildcard in one policy write.
+		var kept []*ateapi.EgressRule
+		for _, r := range pol.Rules {
+			if tp := r.GetTlsPassthrough(); tp != nil && containsHostname(tp.GetHostnames(), FullInternetHost) {
+				continue
+			}
+			if h := r.GetHttp(); h != nil && containsHostname(h.GetHostnames(), FullInternetHost) {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		pol.Rules = append(kept, fullInternetRules()...)
 		if err := m.lc.UpdateEgressPolicy(ctx, atespace, actor, pol); err != nil {
 			return err
 		}
