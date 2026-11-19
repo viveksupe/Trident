@@ -146,10 +146,103 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("TRI_FEATURES_JSON: %w", err)
 		}
 	}
+	applyLegacyAliases(c)
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// legacyEnvAliases maps pre-rename OTS_* variables onto their TRI_* fields
+// (used only when the TRI_* name is unset, so existing env files and
+// container definitions keep working).
+var legacyEnvAliases = map[string]string{
+	"ListenAddr":        "OTS_LISTEN_ADDR",
+	"APIKey":            "OTS_API_KEY",
+	"ActorAPIKey":       "OTS_ACTOR_API_KEY",
+	"ConsoleToken":      "OTS_CONSOLE_TOKEN",
+	"Backend":           "OTS_BACKEND",
+	"StateDB":           "OTS_STATE_DB",
+	"ActorPrefix":       "OTS_ACTOR_PREFIX",
+	"Atespace":          "OTS_ATESPACE",
+	"TemplateRef":       "OTS_TEMPLATE_REF",
+	"APINamespace":      "OTS_API_NAMESPACE",
+	"EgressCallback":    "OTS_EGRESS_CALLBACK",
+	"IdleTTL":           "OTS_IDLE_TTL",
+	"DeleteIdleTTL":     "OTS_DELETE_IDLE_TTL",
+	"MaxAge":            "OTS_MAX_AGE",
+	"SuspendDurability": "OTS_SUSPEND_DURABILITY",
+	"EgressHosts":       "OTS_EGRESS_HOSTS",
+	"Features":          "OTS_FEATURES_JSON",
+}
+
+// applyLegacyAliases fills unset TRI_* values from their OTS_* names.
+func applyLegacyAliases(c *Config) {
+	for field, env := range legacyEnvAliases {
+		v, ok := os.LookupEnv(env)
+		if !ok || v == "" {
+			continue
+		}
+		switch field {
+		case "ListenAddr", "APIKey", "ActorAPIKey", "ConsoleToken", "Backend",
+			"StateDB", "ActorPrefix", "Atespace", "TemplateRef",
+			"APINamespace", "EgressCallback", "SuspendDurability":
+			setStringField(c, field, v)
+		case "IdleTTL", "DeleteIdleTTL", "MaxAge":
+			if d, err := time.ParseDuration(v); err == nil {
+				switch field {
+				case "IdleTTL":
+					c.IdleTTL = d
+				case "DeleteIdleTTL":
+					c.DeleteIdleTTL = d
+				case "MaxAge":
+					c.MaxAge = d
+				}
+			}
+		case "EgressHosts":
+			for _, h := range strings.Split(v, ",") {
+				if h = strings.TrimSpace(h); h != "" {
+					c.EgressHosts = append(c.EgressHosts, h)
+				}
+			}
+		case "Features":
+			var m map[string]bool
+			if json.Unmarshal([]byte(v), &m) == nil {
+				for k, b := range m {
+					c.Features[k] = b
+				}
+			}
+		}
+	}
+}
+
+func setStringField(c *Config, field, v string) {
+	switch field {
+	case "ListenAddr":
+		c.ListenAddr = v
+	case "APIKey":
+		c.APIKey = v
+	case "ActorAPIKey":
+		c.ActorAPIKey = v
+	case "ConsoleToken":
+		c.ConsoleToken = v
+	case "Backend":
+		c.Backend = v
+	case "StateDB":
+		c.StateDB = v
+	case "ActorPrefix":
+		c.ActorPrefix = v
+	case "Atespace":
+		c.Atespace = v
+	case "TemplateRef":
+		c.TemplateRef = v
+	case "APINamespace":
+		c.APINamespace = v
+	case "EgressCallback":
+		c.EgressCallback = v
+	case "SuspendDurability":
+		c.SuspendDurability = v
+	}
 }
 
 // Validate enforces invariants so misconfiguration fails fast at startup.
