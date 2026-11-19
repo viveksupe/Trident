@@ -417,11 +417,30 @@ type State struct {
 	Live    []Grant    `json:"live"`
 	History []Request  `json:"history"`
 	Autos   []AutoRule `json:"autos"`
+	// Per-list pagination (1-based pages; totals for the UI).
+	Page         int `json:"page"`
+	PerPage      int `json:"per_page"`
+	PendingTotal int `json:"pending_total"`
+	PendingPages int `json:"pending_pages"`
+	LivePage     int `json:"live_page"`
+	LiveTotal    int `json:"live_total"`
+	LivePages    int `json:"live_pages"`
+	HistoryPage  int `json:"history_page"`
+	HistoryTotal int `json:"history_total"`
+	HistoryPages int `json:"history_pages"`
+	AutosPage    int `json:"autos_page"`
+	AutosTotal   int `json:"autos_total"`
+	AutosPages   int `json:"autos_pages"`
+}
+
+// PagedParams selects one page per list.
+type PagedParams struct {
+	PendingPage, LivePage, HistoryPage, AutosPage, PerPage int
 }
 
 // requestByID scans pending+history for a request.
 func (m *Manager) requestByID(id int64) (Request, bool, error) {
-	pending, err := m.store.Pending()
+	pending, _, err := m.store.PendingPaged(1000, 0)
 	if err != nil {
 		return Request{}, false, err
 	}
@@ -460,12 +479,46 @@ func (m *Manager) ClearAuto(actor string) error {
 	return nil
 }
 
-// Snapshot returns the console's view.
-func (m *Manager) Snapshot() (State, error) {
-	pending, err := m.store.Pending()
+// SnapshotPage returns the console view with pending requests paginated
+// (page is 1-based; perPage ≤ 0 means a sane default; page beyond the end
+// clamps to the last page).
+func (m *Manager) SnapshotPage(p PagedParams) (State, error) {
+	perPage := p.PerPage
+	if perPage <= 0 || perPage > 100 {
+		perPage = 25
+	}
+	page := p.PendingPage
+	if page < 1 {
+		page = 1
+	}
+	pending, total, err := m.store.PendingPaged(perPage, (page-1)*perPage)
 	if err != nil {
 		return State{}, err
 	}
+	pages := (total + perPage - 1) / perPage
+	if pages < 1 {
+		pages = 1
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > pages {
+		page = pages
+	}
+	st, err := m.snapshotCommon()
+	if err != nil {
+		return State{}, err
+	}
+	st.Pending, st.Page, st.PerPage, st.PendingTotal, st.PendingPages = pending, page, perPage, total, pages
+	return st, nil
+}
+
+// Snapshot returns the console's view (all pendings, one page).
+func (m *Manager) Snapshot() (State, error) {
+	return m.SnapshotPage(PagedParams{})
+}
+
+func (m *Manager) snapshotCommon() (State, error) {
 	live, err := m.store.Live()
 	if err != nil {
 		return State{}, err
@@ -480,8 +533,7 @@ func (m *Manager) Snapshot() (State, error) {
 		return State{}, err
 	}
 	return State{
-		Pending: orEmpty(pending), Live: orEmpty(live),
-		History: orEmpty(hist), Autos: orEmpty(autos),
+		Live: orEmpty(live), History: orEmpty(hist), Autos: orEmpty(autos),
 	}, nil
 }
 

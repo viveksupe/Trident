@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/viveksupe/Trident/internal/egress"
 )
 
 //go:embed egress_console.html
@@ -298,7 +300,12 @@ func (s *Server) egressState(w http.ResponseWriter, r *http.Request) {
 	if !s.consoleAuthed(w, r) {
 		return
 	}
-	state, err := s.egress.Snapshot()
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("pending_page"))
+	live, _ := strconv.Atoi(q.Get("live_page"))
+	hist, _ := strconv.Atoi(q.Get("history_page"))
+	per, _ := strconv.Atoi(q.Get("per_page"))
+	state, err := s.egress.SnapshotPage(egress.PagedParams{PendingPage: page, LivePage: live, HistoryPage: hist, PerPage: per})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, detail{err.Error()})
 		return

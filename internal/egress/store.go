@@ -100,6 +100,40 @@ func (s *Store) InsertRequest(r *Request) error {
 	return err
 }
 
+// PendingPaged returns one page of pending requests (oldest first) and the
+// total count.
+func (s *Store) PendingPaged(limit, offset int) ([]Request, int, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM egress_requests WHERE status='pending'`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.Query(`SELECT id,atespace,actor_name,host,reason,status,created,decided
+		FROM egress_requests WHERE status='pending' ORDER BY id ASC LIMIT ? OFFSET ?`,
+		limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		var r Request
+		var created, decided int64
+		if err := rows.Scan(&r.ID, &r.Atespace, &r.ActorName, &r.Host, &r.Reason,
+			&r.Status, &created, &decided); err != nil {
+			return nil, 0, err
+		}
+		r.Created, r.Decided = time.Unix(0, created), time.Unix(0, decided)
+		out = append(out, r)
+	}
+	return out, total, rows.Err()
+}
+
 // Pending lists requests awaiting a decision, oldest first.
 func (s *Store) Pending() ([]Request, error) {
 	return s.list(`SELECT id,atespace,actor_name,host,reason,status,created,decided
@@ -196,6 +230,73 @@ func (s *Store) ClearHistory() (int64, error) {
 	_, err = s.db.Exec(`DELETE FROM egress_grants WHERE revoked<>0 OR
 		(expires<>0 AND expires < strftime('%s','now') * 1000000000)`)
 	return n, err
+}
+
+// LivePaged returns one page of live grants (newest granted first) + total.
+func (s *Store) LivePaged(limit, offset int) ([]Grant, int, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM egress_grants WHERE revoked=0`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.Query(`SELECT id,request_id,atespace,actor_name,host,granted,expires,revoked
+		FROM egress_grants WHERE revoked=0 ORDER BY granted DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []Grant
+	for rows.Next() {
+		var g Grant
+		var granted, expires, revoked int64
+		if err := rows.Scan(&g.ID, &g.RequestID, &g.Atespace, &g.ActorName, &g.Host,
+			&granted, &expires, &revoked); err != nil {
+			return nil, 0, err
+		}
+		g.Granted, g.Expires = time.Unix(0, granted), time.Unix(0, expires)
+		if revoked != 0 {
+			g.Revoked = time.Unix(0, revoked)
+		}
+		out = append(out, g)
+	}
+	return out, total, rows.Err()
+}
+
+// HistoryPaged returns one page of decided requests (newest first) + total.
+func (s *Store) HistoryPaged(limit, offset int) ([]Request, int, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM egress_requests WHERE status<>'pending'`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.Query(`SELECT id,atespace,actor_name,host,reason,status,created,decided
+		FROM egress_requests WHERE status<>'pending' ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		var r Request
+		var created, decided int64
+		if err := rows.Scan(&r.ID, &r.Atespace, &r.ActorName, &r.Host, &r.Reason,
+			&r.Status, &created, &decided); err != nil {
+			return nil, 0, err
+		}
+		r.Created, r.Decided = time.Unix(0, created), time.Unix(0, decided)
+		out = append(out, r)
+	}
+	return out, total, rows.Err()
 }
 
 // Live returns grants not yet revoked.
@@ -303,6 +404,31 @@ func (s *Store) SetAuto(actor string, ttlSeconds int64) error {
 func (s *Store) ClearAuto(actor string) error {
 	_, err := s.db.Exec(`DELETE FROM egress_autos WHERE actor_name=?`, actor)
 	return err
+}
+
+// AutosPaged returns one page of auto rules + total.
+func (s *Store) AutosPaged(limit, offset int) ([]AutoRule, int, error) {
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM egress_autos`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.Query(`SELECT actor_name,ttl_seconds,created FROM egress_autos
+		ORDER BY actor_name LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []AutoRule
+	for rows.Next() {
+		var a AutoRule
+		var created int64
+		if err := rows.Scan(&a.ActorName, &a.TTL, &created); err != nil {
+			return nil, 0, err
+		}
+		a.Created = time.Unix(0, created)
+		out = append(out, a)
+	}
+	return out, total, rows.Err()
 }
 
 // Autos lists the auto-approve rules.
