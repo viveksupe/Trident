@@ -76,8 +76,13 @@ func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, detail{err.Error()})
 		return
 	}
-	if body.Action == "delete" && s.pl != nil {
-		s.pl.ForgetByActorName(body.Name)
+	if body.Action == "delete" {
+		if s.pl != nil {
+			s.pl.ForgetByActorName(body.Name)
+		}
+		if s.egress != nil {
+			_ = s.egress.PurgeActor(ctx, body.Name)
+		}
 	}
 	// substrate releases the actor's snapshots and durable volume on delete
 	// (the actor is the sole owner of both); the egress policy is nested

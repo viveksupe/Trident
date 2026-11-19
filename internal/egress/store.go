@@ -134,6 +134,21 @@ func (s *Store) PendingPaged(limit, offset int) ([]Request, int, error) {
 	return out, total, rows.Err()
 }
 
+// PurgeActor removes every egress bookkeeping row for actor: pending
+// requests, grant records, standing auto rules.
+func (s *Store) PurgeActor(actor string) error {
+	for _, stmt := range []string{
+		`DELETE FROM egress_requests WHERE actor_name=?`,
+		`DELETE FROM egress_grants WHERE actor_name=?`,
+		`DELETE FROM egress_autos WHERE actor_name=?`,
+	} {
+		if _, err := s.db.Exec(stmt, actor); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Pending lists requests awaiting a decision, oldest first.
 func (s *Store) Pending() ([]Request, error) {
 	return s.list(`SELECT id,atespace,actor_name,host,reason,status,created,decided

@@ -155,6 +155,17 @@ func (m *Manager) Deny(requestID int64) error {
 	return nil
 }
 
+// PurgeActor drops all bookkeeping for a deleted actor. The substrate egress
+// policy does not need patching: it is nested under the actor and destroyed
+// with it.
+func (m *Manager) PurgeActor(_ context.Context, actor string) error {
+	if err := m.store.PurgeActor(actor); err != nil {
+		return err
+	}
+	m.log.Info("egress bookkeeping purged for actor", "actor", actor)
+	return nil
+}
+
 // RevokeAll closes every live grant and returns how many were closed.
 func (m *Manager) RevokeAll(ctx context.Context) (int, error) {
 	live, err := m.store.Live()

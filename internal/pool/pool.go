@@ -25,12 +25,15 @@ type session struct {
 
 // Pool reconciles route keys to backend actors.
 type Pool struct {
-	backend       backend.Backend
-	store         *sessionmap.Store
-	log           *slog.Logger
-	idleTTL       time.Duration
-	deleteIdleTTL time.Duration
-	maxAge        time.Duration
+	backend backend.Backend
+	store   *sessionmap.Store
+	// OnActorDeleted, when set, fires after a successful full delete
+	// (console purge or long-idle sweep) so side stores can clean up.
+	OnActorDeleted func(actorName string)
+	log            *slog.Logger
+	idleTTL        time.Duration
+	deleteIdleTTL  time.Duration
+	maxAge         time.Duration
 	// AllowSuspend enables the idle suspend ticker (disable it for dev backends
 	// whose suspend semantics differ, e.g. plain docker stop).
 	AllowSuspend bool
@@ -198,6 +201,9 @@ func (p *Pool) sweep(ctx context.Context) {
 			err = p.backend.Delete(ctxT, v.handle)
 			if err == nil && p.store != nil {
 				_ = p.store.Delete(v.key)
+			}
+			if err == nil && p.OnActorDeleted != nil {
+				p.OnActorDeleted(v.handle.Name)
 			}
 		} else {
 			err = p.backend.Suspend(ctxT, v.handle)

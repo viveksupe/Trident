@@ -164,6 +164,14 @@ func serveCmd(log *slog.Logger) error {
 		}
 	}
 	pl := pool.New(backendImpl, store, log, cfg.IdleTTL, cfg.DeleteIdleTTL, cfg.MaxAge)
+	if egressManager != nil {
+		// Console purges and long-idle sweeps also wipe this actor's egress
+		// bookkeeping (pendings, grants, standing rules).
+		pl.OnActorDeleted = func(actorName string) {
+			_ = egressManager.PurgeActor(context.Background(), actorName)
+		}
+	}
+	_ = sweeper
 	if cfg.Backend == config.BackendDocker {
 		pl.AllowSuspend = false // docker stop loses container state; actors stay up
 	}
@@ -201,7 +209,11 @@ func serveCmd(log *slog.Logger) error {
 		}()
 		log.Info("egress report sweeper enabled (exec channel)")
 	}
-	if err := reconcileOnRestart(ctx, log, backendImpl, store); err != nil {
+	var eflow egressPurger
+	if egressManager != nil {
+		eflow = egressManager
+	}
+	if err := reconcileOnRestart(ctx, log, backendImpl, store, eflow); err != nil {
 		log.Warn("restart reconciliation failed (continuing)", "err", err)
 	}
 
@@ -276,11 +288,16 @@ func bootstrapCmd(log *slog.Logger, args []string) error {
 	return substrate.RunBootstrap(log, cfg, img, wait)
 }
 
+// egressPurger is the slice of the egress manager reconcileOnRestart needs.
+type egressPurger interface {
+	PurgeActor(ctx context.Context, actor string) error
+}
+
 // reconcileOnRestart prunes persisted session-map rows whose actors no
 // longer exist in the backend (deleted externally or expired) and reports
 // actors that are still live. Actor names are derived deterministically from
 // the route key, so surviving mappings need no migration.
-func reconcileOnRestart(ctx context.Context, log *slog.Logger, backendImpl backend.Backend, store *sessionmap.Store) error {
+func reconcileOnRestart(ctx context.Context, log *slog.Logger, backendImpl backend.Backend, store *sessionmap.Store, eflow egressPurger) error {
 	all, err := store.All()
 	if err != nil || len(all) == 0 {
 		return err
@@ -302,6 +319,15 @@ func reconcileOnRestart(ctx context.Context, log *slog.Logger, backendImpl backe
 		}
 	}
 	log.Info("session map reconciled", "kept", len(keep), "pruned", len(all)-len(keep))
+	// Egress bookkeeping for actors the backend no longer has: purge it at
+	// startup too (TTL deletes that happened while the shim was down).
+	if eflow != nil {
+		for key := range all {
+			if _, ok := keep[key]; !ok {
+				_ = eflow.PurgeActor(context.Background(), all[key].ActorName)
+			}
+		}
+	}
 	return store.Prune(keep)
 }
 
