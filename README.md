@@ -34,8 +34,8 @@ Open WebUI ──Open Terminal protocol (HTTP+WS)──▷ trident
   per-actor egress policy (`tls_passthrough` for LLM APIs and package
   registries; deny-by-default otherwise).
 - Lifecycle is trident-s job (substrate never auto-suspends): an idle ticker
-  suspends actors after `OTS_IDLE_TTL` (default 10m) once no request or spliced
-  WebSocket is live, and deletes them past `OTS_MAX_AGE`. MEMORY-fidelity
+  suspends actors after `TRI_IDLE_TTL` (default 10m) once no request or spliced
+  WebSocket is live, and deletes them past `TRI_MAX_AGE`. MEMORY-fidelity
   snapshots preserve the agent process, so a resumed chat continues
   mid-conversation.
 - The data plane always goes through atenet-router's **CONNECT tunnels
@@ -55,16 +55,16 @@ trident bootstrap -image ghcr.io/you/ot-actor@sha256:...
 cp manifest/values.sh.example manifest/values.sh  # edit values
 scripts/deploy.sh
 # 4. Or run trident out-of-cluster against the kind cluster:
-OTS_BACKEND=substrate OTS_API_KEY=... OTS_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
+TRI_BACKEND=substrate TRI_API_KEY=... TRI_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
 ```
 
 For development **without a cluster** (M0 path):
 
 ```bash
 docker buildx build -t ot-actor:dev images/actor
-OTS_API_KEY=test-key \
-OTS_BACKEND=docker OTS_DOCKER_IMAGE=ot-actor:dev \
-OTS_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
+TRI_API_KEY=test-key \
+TRI_BACKEND=docker TRI_DOCKER_IMAGE=ot-actor:dev \
+TRI_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
 ```
 
 ## Open WebUI setup
@@ -73,7 +73,7 @@ Admin Settings → Integrations → Open Terminal:
 
 - **URL**: trident-s URL (`http://...` as reachable from Open WebUI — a NodePort,
   ingress, or `kubectl port-forward svc/trident 8080:80`)
-- **API key**: the value of `OTS_API_KEY`
+- **API key**: the value of `TRI_API_KEY`
 
 Open WebUI probes `GET /api/v1/terminals/templates` (answered 404), reads the
 features map, and shows the terminal in chat. Discovered agent models appear as
@@ -84,24 +84,37 @@ Stop (`DELETE` the session) and continuation (resume from the chat's snapshot).
 
 | Var | Default | Meaning |
 |---|---|---|
-| `OTS_API_KEY` | (required) | front-side Bearer key Open WebUI presents |
-| `OTS_ACTOR_API_KEY` | = `OTS_API_KEY` | keep equal — WS auth frames pass through unrewritten |
-| `OTS_BACKEND` | `substrate` | `substrate` or `docker` (dev) |
-| `OTS_STATE_DB` | `sessionmap.db` | sqlite chat→actor map (restart reconciliation) |
-| `OTS_LISTEN_ADDR` | `127.0.0.1:8080` | facade address |
-| `OTS_ATESPACE` | `ots-webui` | atespace for chat actors |
-| `OTS_TEMPLATE_REF` | `ots-webui/open-terminal` | `"<atespace>/<name>"` ActorTemplate |
-| `OTS_ACTOR_PREFIX` | `ot-` | actor-name prefix (reconcile + cleanup scope) |
-| `OTS_ACTOR_PORT` | `8000` | the open-terminal port inside the actor |
-| `OTS_IDLE_TTL` | `10m` | idle before suspend |
-| `OTS_MAX_AGE` | `168h` | age before delete |
-| `OTS_SUSPEND_DURABILITY` | `async` | `async` (fast, node-local then background upload) or `sync` |
-| `OTS_EGRESS_HOSTS` | anthropic/openai/pypi/npm… | per-actor tls-passthrough allowlist |
-| `OTS_FEATURES_JSON` | core on, browser/desktop off | the `/api/config` features map |
-| `OTS_DOCKER_IMAGE` | — | required for `OTS_BACKEND=docker` |
-| `OTS_DOCKER_ENV` | — | extra `K=V` env for docker-mode actors |
-| `ATE_NAMESPACE`, `OTS_API_SERVICE`, `OTS_API_TOKEN_FILE`, `KUBECONFIG` | ate-system / api / — / — | substrate connection |
-| `OTS_LOG_LEVEL` | info | `debug` for request logging |
+| `TRI_API_KEY` | (required) | front-side Bearer key Open WebUI presents |
+| `TRI_ACTOR_API_KEY` | = `TRI_API_KEY` | keep equal — WS auth frames pass through unrewritten |
+| `TRI_CONSOLE_TOKEN` | (required with egress flow) | human-only console token (≠ `TRI_API_KEY`); manages the approval UI |
+| `TRI_CONSOLE_SHOW_DEFAULT` | `true` | prefill the default console token on console pages |
+| `TRI_BACKEND` | `substrate` | `substrate` or `docker` (dev) |
+| `TRI_STATE_DB` | `sessionmap.db` | sqlite chat→actor map + egress bookkeeping |
+| `TRI_LISTEN_ADDR` | `127.0.0.1:8080` | facade address |
+| `TRI_ATESPACE` | `ots-webui` | atespace for chat actors |
+| `TRI_TEMPLATE_REF` | `ots-webui/open-terminal` | `"<atespace>/<name>"` ActorTemplate |
+| `TRI_ACTOR_PREFIX` | `ot-` | actor-name prefix (reconcile + cleanup scope) |
+| `TRI_ACTOR_PORT` | `8000` | the open-terminal port inside the actor |
+| `TRI_IDLE_TTL` | `10m` | idle → suspend (snapshot, pod freed) |
+| `TRI_DELETE_IDLE_TTL` | `48h` | idle → full purge (frees the durable volume) |
+| `TRI_MAX_AGE` | `168h` | hard cap from creation |
+| `TRI_SUSPEND_DURABILITY` | `async` | `async` (fast, node-local then background upload) or `sync` |
+| `TRI_EGRESS_HOSTS` | anthropic/openai/pypi/npm… | per-actor tls-passthrough allowlist |
+| `TRI_FEATURES_JSON` | core on, browser/desktop off | the `/api/config` features map |
+| `TRI_DOCKER_IMAGE` | — | required for `TRI_BACKEND=docker` |
+| `TRI_DOCKER_ENV` | — | extra `K=V` env for docker-mode actors |
+| `TRI_API_SERVICE`, `TRI_CLIENT_SA`, `TRI_ROUTE_NAMESPACE`, `TRI_ROUTE_SA` | api / ate-client / ate-system / atenet-client | substrate connection details |
+| `ATE_NAMESPACE`, `TRI_API_TOKEN_FILE`, `KUBECONFIG` | ate-system / — / — | ateapi namespace, token file, out-of-cluster kubeconfig |
+| `TRI_LOG_LEVEL` | info | `debug` for request logging |
+| `TRI_TLS_LISTEN_ADDR` | `:8443` | egress-callback TLS listener |
+| `TRI_EGRESS_CALLBACK` | — | in-cluster callback Service:port (enables the approval flow) |
+| `TRI_EGRESS_OBSERVER` / `..._POD_SELECTOR` | `true` / `app=atenet-egress` | gateway-deny-log observer |
+| `TRI_CPU_MILLICORES` / `TRI_MEMORY_BYTES` | 2000 / 4 Gi | ActorTemplate sizing at bootstrap |
+
+The complete, current reference lives in **`scripts/trident.env.example`** (usable
+with `--env-file`). Pre-rename `OTS_*` variables still work as fallbacks where
+`TRI_*` names are unset. The deployed instance's env can be kept in a file such
+as `/home/vsupe/.ot-trident.env` (docker `--env-file`-compatible).
 
 Substrate layout: `manifest/actor` → embedded ActorTemplate,
 `manifest/workers/workerpool.yaml.tmpl` → WorkerPool CRD,
@@ -110,7 +123,7 @@ Substrate layout: `manifest/actor` → embedded ActorTemplate,
 ## Caveats (known, deliberate)
 
 - **Key:** the shim key and the actor key are the same value by design. Setting
-  `OTS_ACTOR_API_KEY` to something else breaks agent/terminal WebSockets in v1
+  `TRI_ACTOR_API_KEY` to something else breaks agent/terminal WebSockets in v1
   (their auth arrives in the first WS frame, not a header) and is logged as a
   startup warning.
 - **Upgrades:** actor images are digest-pinned; a new template cold-boots every
@@ -123,7 +136,7 @@ Substrate layout: `manifest/actor` → embedded ActorTemplate,
   message by default, so this rarely matters).
 - **gVisor** compatibility of the agent toolchain (setcap python copy, `sudo`,
   `/proc` port detection) is the top validation item against a real substrate
-  install; `OTS_BACKEND=docker` stays available as a fallback/demo mode.
+  install; `TRI_BACKEND=docker` stays available as a fallback/demo mode.
 - Browser/desktop features are feature-flagged off in v1; the flags are how
   you'd re-enable them after validating Chromium/XFCE under the sandbox.
 
