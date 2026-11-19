@@ -144,11 +144,17 @@ func (m *Manager) SubmitObserved(ctx context.Context, atespace, actor, host, ip,
 	if host != "" {
 		host = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
 		if existing, err := m.store.PendingFor(actor, host); err == nil && len(existing) > 0 {
+			m.approvePendingIfAuto(ctx, &existing[0])
 			return &existing[0], nil
 		}
 	}
 	r := &Request{Atespace: atespace, ActorName: actor, Host: host, Reason: reason, Status: StatusPending}
 	if err := m.store.InsertRequest(r); err != nil {
+		return nil, err
+	}
+	// Observations honor the actor's standing auto rule too, same as the
+	// helper path — otherwise auto-approve silently misses the primary flow.
+	if err := m.maybeAutoApprove(ctx, r); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -201,5 +207,3 @@ func ptrHost(ip string) string {
 }
 
 func int64Ptr(n int64) *int64 { return &n }
-
-

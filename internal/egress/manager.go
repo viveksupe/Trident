@@ -54,7 +54,9 @@ func (m *Manager) Submit(ctx context.Context, actor, host, reason string) (*Requ
 		return nil, fmt.Errorf("invalid hostname %q", host)
 	}
 	if existing, err := m.store.PendingFor(actor, host); err == nil && len(existing) > 0 {
-		// One pending request per (actor, host) is enough.
+		// One pending request per (actor, host) is enough; a newly enabled
+		// auto rule applies to it on the next ask.
+		m.approvePendingIfAuto(ctx, &existing[0])
 		return &existing[0], nil
 	}
 	atespace, ok, err := m.check(ctx, actor)
@@ -68,26 +70,44 @@ func (m *Manager) Submit(ctx context.Context, actor, host, reason string) (*Requ
 	if err := m.store.InsertRequest(r); err != nil {
 		return nil, err
 	}
-
-	// Auto-approve rules shortcut the human: grant immediately with the
-	// rule's TTL. Logged loudly — this is deliberate standing permission,
-	// not a silent bypass.
-	if auto, ok, err := m.store.AutoFor(actor); err == nil && ok {
-		var ttl time.Duration
-		if auto.TTL > 0 {
-			ttl = time.Duration(auto.TTL) * time.Second
-		}
-		if err := m.approveRequestLocked(ctx, *r, ttl); err != nil {
-			return nil, err
-		}
-		r.Status = StatusApproved
-		r.Decided = time.Now()
-		m.log.Warn("egress AUTO-approved (standing rule)", "actor", actor, "host", host, "ttl", ttl)
-		return r, nil
+	if err := m.maybeAutoApprove(ctx, r); err != nil {
+		return nil, err
 	}
-
 	m.log.Info("egress requested", "actor", actor, "host", host, "reason", reason)
 	return r, nil
+}
+
+// approvePendingIfAuto applies an actor's standing rule to an existing
+// pending request (dedup path): auto rules must catch requests filed before
+// the rule was enabled, exactly as they catch fresh ones.
+func (m *Manager) approvePendingIfAuto(ctx context.Context, r *Request) {
+	if r.Status != StatusPending {
+		return
+	}
+	if err := m.maybeAutoApprove(ctx, r); err != nil {
+		m.log.Debug("auto-apply skipped", "request", r.ID, "err", err)
+	}
+}
+
+// maybeAutoApprove fires the actor's standing rule, if any: grant immediately
+// with the rule's TTL. Logged loudly — this is deliberate standing
+// permission, not a silent bypass.
+func (m *Manager) maybeAutoApprove(ctx context.Context, r *Request) error {
+	auto, ok, err := m.store.AutoFor(r.ActorName)
+	if err != nil || !ok {
+		return err
+	}
+	var ttl time.Duration
+	if auto.TTL > 0 {
+		ttl = time.Duration(auto.TTL) * time.Second
+	}
+	if err := m.approveRequestLocked(ctx, *r, ttl); err != nil {
+		return err
+	}
+	r.Status = StatusApproved
+	r.Decided = time.Now()
+	m.log.Warn("egress AUTO-approved (standing rule)", "actor", r.ActorName, "host", r.Host, "ttl", ttl)
+	return nil
 }
 
 // approveRequestLocked performs the grant + policy patch common to the
