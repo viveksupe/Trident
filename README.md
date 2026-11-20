@@ -109,7 +109,7 @@ Stop (`DELETE` the session) and continuation (resume from the chat's snapshot).
 | `TRI_TLS_LISTEN_ADDR` | `:8443` | egress-callback TLS listener |
 | `TRI_EGRESS_CALLBACK` | — | in-cluster callback Service:port (enables the approval flow) |
 | `TRI_EGRESS_OBSERVER` / `..._POD_SELECTOR` | `true` / `app=atenet-egress` | gateway-deny-log observer |
-| `TRI_CPU_MILLICORES` / `TRI_MEMORY_BYTES` | 1000 / 2 Gi | ActorTemplate sizing at bootstrap (workers must fit restore margin: 2 CPU / 4608Mi, see manifest/values.sh.example; a 2560Mi worker makes resume fail with "no worker has room") |
+| `TRI_CPU_MILLICORES` / `TRI_MEMORY_BYTES` | 500 / 768 Mi | per-chat actor sizing (substrate guidance: a 4 CPU / 8 GiB worker then holds 6-8 concurrent chats; keep workers comfortably above the restore margin) |
 
 The complete, current reference lives in **`scripts/trident.env.example`** (usable
 with `--env-file`). Pre-rename `OTS_*` variables still work as fallbacks where

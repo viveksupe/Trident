@@ -34,7 +34,7 @@ TRI_IMAGE="${TRI_IMAGE:-trident:dev}"
 echo "==> applying worker pool"
 export WORKERPOOL_NAMESPACE="${TRI_NAMESPACE}"
 export WORKERPOOL_REPLICAS="${WORKERPOOL_REPLICAS:-3}"
-export WORKERPOOL_CPU="${WORKERPOOL_CPU:-2}"
+export WORKERPOOL_CPU="${WORKERPOOL_CPU:-4}"
 export WORKERPOOL_MEMORY="${WORKERPOOL_MEMORY:-2560Mi}"
 kubectl label namespace "${WORKERPOOL_NAMESPACE}" ate.dev/api-access=true --overwrite
 envsubst < manifest/workers/workerpool.yaml.tmpl | kubectl apply -f -

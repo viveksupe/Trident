@@ -20,8 +20,8 @@ spec:
   replicas: ${WORKERPOOL_REPLICAS}
   workerImage: ${WORKER_IMAGE} # digest-pinned ateworker image the nodes can pull
   template:
-    # One worker per running actor: the limits match the ActorTemplate's
-    # sizing (1 CPU / 2Gi) plus worker overhead — substrate demo-consistent.
+    # Workers multiplex many chat actors: with 500m/768Mi actors a
+    # 4 CPU / 8192Mi worker holds 6-8 concurrent chats (substrate guidance).
     resources:
       limits:
         cpu: "${WORKERPOOL_CPU}"

@@ -41,9 +41,10 @@ export EGRESS_HOSTS="api.anthropic.com,api.openai.com,sentry.io,pypi.org,files.p
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
-# Worker pool (one worker per actor; worker must exceed the actor's 2Gi by
-# the gVisor restore margin — empirically 4608Mi; 2560Mi makes resume fail
-# with "no worker has room").
+# Worker pool multiplexes many chat actors per worker. Conservative pairing
+# for 500m/768Mi actors: 4 CPU / 8192Mi workers hold 6-8 chats. Workers must
+# still exceed one actor's restore margin, or resume fails "no worker has
+# room" (seen at 2560Mi with 2Gi actors).
 export WORKERPOOL_REPLICAS="3"
-export WORKERPOOL_CPU="2"
-export WORKERPOOL_MEMORY="4608Mi"
+export WORKERPOOL_CPU="4"
+export WORKERPOOL_MEMORY="8192Mi"
