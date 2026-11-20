@@ -67,13 +67,13 @@ func (s *Server) Handler() http.Handler {
 	// terminal connections WITHOUT the bearer key (only headers it already
 	// sends, e.g. X-User-Id); open-terminal serves its docs/public paths
 	// unauthenticated, so these pass through with no auth check either.
-	// The spec fetch is served from the template cache first (no actor needed
-	// for a static JSON doc); docs/redoc still proxy as before.
-	mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, r *http.Request) {
-		s.serveSpec(w, r)
-	})
-	for _, p := range []string{"GET /docs", "GET /redoc"} {
-		mux.HandleFunc(p, s.routeNoAuth)
+	// Spec + doc pages are served from the template cache first — no actor is
+	// needed to serve static content, so keyless polls stopped spinning up the
+	// adhoc sandbox.
+	for _, p := range []string{"GET /openapi.json", "GET /docs", "GET /redoc"} {
+		mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) {
+			s.serveSpec(w, r)
+		})
 	}
 
 	mux.HandleFunc("/", s.route)

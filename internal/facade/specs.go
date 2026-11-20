@@ -55,11 +55,17 @@ func (c *specCache) save(templateRef string, body []byte) {
 	_ = os.Rename(tmp, f)
 }
 
-// serveSpec answers keyless /openapi.json from the cache; on a miss it proxies
-// to the actor as usual and records the body for next time. Returns true when
-// the request was handled here.
+// serveSpec answers keyless spec/doc paths (/openapi.json, /docs, /redoc)
+// from the cache; on a miss it proxies to the actor as usual and records the
+// body for next time. Returns true when the request was handled here — the
+// goal is that no keyless poll ever spins up the adhoc actor.
 func (s *Server) serveSpec(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method != http.MethodGet || r.URL.Path != "/openapi.json" {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	switch r.URL.Path {
+	case "/openapi.json", "/docs", "/redoc":
+	default:
 		return false
 	}
 	if body, ok := s.specs.load(s.cfg.TemplateRef); ok {
