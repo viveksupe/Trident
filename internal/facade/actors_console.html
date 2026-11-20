@@ -115,12 +115,24 @@ const $ = id => document.getElementById(id);
 const auth = () => ({'Authorization': 'Bearer ' + localStorage.getItem('ots-console-token')});
 async function api(path, opts) { return fetch(path, {headers: auth(), ...opts}); }
 function esc(s) { return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function rel(iso) {
+  const left = new Date(iso) - Date.now();
+  if (isNaN(left)) return '';
+  if (left <= 0) return 'now';
+  const d = Math.floor(left / 86400000), h = Math.floor((left % 86400000) / 3600000), m = Math.round((left % 3600000) / 60000);
+  return d ? d + 'd' + (h ? h + 'h' : '') : h ? h + 'h' + (m ? m + 'm' : '') : Math.max(1, m) + 'm';
+}
 function card(a) {
+  const badges = [];
+  badges.push(`<span class="badge">${esc((a.state||'?').replace('ACTOR_STATE_', '').toLowerCase())}</span>`);
+  if (a.live) badges.push('<span class="badge" style="color:var(--ok, #2ea043)">● terminal live</span>');
+  if (a.suspend_eta) badges.push(`<span class="badge" title="Auto-suspends ~2 min after the last terminal closes">suspends ${esc(rel(a.suspend_eta))}${a.live ? '… (tab held open)' : ''}</span>`);
+  if (a.purge_eta) badges.push(`<span class="badge" title="Full purge (files + snapshots wiped) — projected from last activity + idle-delete TTL, or the 7-day max age">purge ${esc(rel(a.purge_eta))} · ${new Date(a.purge_eta).toLocaleString()}</span>`);
+  if (a.template) badges.push(`<span class="badge">template ${esc(a.template)}</span>`);
   return `<div class="card"><div class="row">
     <span class="mono" style="color:var(--text)">${esc(a.name)}</span>
-    <span class="badge">${esc((a.state||'?').replace('ACTOR_STATE_', '').toLowerCase())}</span>
-    ${a.template ? `<span class="badge">template ${esc(a.template)}</span>` : ''}
-    ${a.created ? `<span class="badge">created ${esc(a.created)}</span>` : ''}
+    ${badges.join('')}
+    ${a.created ? `<span class="badge" class="mono">created ${new Date(a.created).toLocaleDateString()}</span>` : ''}
     <span class="row" style="margin-left:auto">
       <button class="suspend" onclick="act('${esc(a.name)}','suspend')">Suspend</button>
       <button class="ghost" onclick="fullInternet('${esc(a.name)}')" title="Open ALL destinations on ALL ports where a TLS handshake appears. Removes zero-trust path filtering until revoked or expired.">🌐 Full internet</button>

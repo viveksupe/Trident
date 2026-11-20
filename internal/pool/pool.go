@@ -76,6 +76,9 @@ func (p *Pool) Acquire(ctx context.Context, key model.RouteKey) (Ready, *Infligh
 
 	p.mu.Lock()
 	ses.lastActive = p.now()
+	if p.store != nil {
+		_ = p.store.SetLastSeen(key, ses.lastActive)
+	}
 	ses.inflight++
 	p.mu.Unlock()
 
@@ -83,6 +86,9 @@ func (p *Pool) Acquire(ctx context.Context, key model.RouteKey) (Ready, *Infligh
 		p.mu.Lock()
 		ses.inflight--
 		ses.lastActive = p.now()
+		if p.store != nil {
+			_ = p.store.SetLastSeen(key, ses.lastActive)
+		}
 		p.mu.Unlock()
 	}}
 	return Ready{Handle: *ses.handle, Dialer: ses.dialer}, inf, nil
@@ -207,6 +213,9 @@ func (p *Pool) sweep(ctx context.Context) {
 			}
 		} else {
 			err = p.backend.Suspend(ctxT, v.handle)
+			if err == nil {
+				p.log.Info("suspended idle actor", "actor", v.handle.Name)
+			}
 		}
 		if err != nil {
 			p.log.Warn("lifecycle sweep failed", "actor", v.handle.Name, "err", err)
@@ -237,6 +246,49 @@ func (p *Pool) ForgetByActorName(name string) {
 			_ = p.store.Delete(key)
 		}
 	}
+}
+
+// IdleInfo is an actor's last known activity: Tracked marks in-memory
+// sessions (accurate), other entries come from the persisted row (survives
+// shim restarts; falls back to row creation when never recorded).
+type IdleInfo struct {
+	LastSeen time.Time
+	Tracked  bool
+}
+
+func (i IdleInfo) Time() time.Time {
+	if i.Tracked {
+		return i.LastSeen
+	}
+	return i.LastSeen
+}
+
+// IdleEtas maps actor name → last known activity: in-memory sessions first,
+// otherwise the persisted row (survives shim restarts).
+func (p *Pool) IdleEtas() map[string]IdleInfo {
+	out := map[string]IdleInfo{}
+	p.mu.Lock()
+	for _, ses := range p.ses {
+		if ses.handle != nil {
+			out[ses.handle.Name] = IdleInfo{LastSeen: ses.lastActive, Tracked: true}
+		}
+	}
+	p.mu.Unlock()
+	if p.store != nil {
+		if entries, err := p.store.All(); err == nil {
+			for _, e := range entries {
+				if _, ok := out[e.ActorName]; ok {
+					continue
+				}
+				la := e.LastSeen
+				if la.IsZero() {
+					la = e.CreatedAt // conservative: row began at creation
+				}
+				out[e.ActorName] = IdleInfo{LastSeen: la}
+			}
+		}
+	}
+	return out
 }
 
 // LiveKeys returns the route keys currently tracked (for the report sweeper).

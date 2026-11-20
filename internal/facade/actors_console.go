@@ -4,18 +4,25 @@ package facade
 
 import (
 	"context"
+
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/viveksupe/Trident/internal/pool"
 
 	"github.com/viveksupe/Trident/internal/backend"
 )
 
 type actorView struct {
-	Name     string `json:"name"`
-	State    string `json:"state"`
-	Template string `json:"template"`
-	Created  string `json:"created,omitempty"`
+	Name       string `json:"name"`
+	State      string `json:"state"`
+	Template   string `json:"template"`
+	Created    string `json:"created,omitempty"`
+	LastActive string `json:"last_active,omitempty"`
+	SuspendETA string `json:"suspend_eta,omitempty"` // next idle suspend
+	PurgeETA   string `json:"purge_eta,omitempty"`   // projected full purge
+	Live       bool   `json:"live,omitempty"`        // activity in the last 60s
 }
 
 // actorsState lists the backend's actors (name + template).
@@ -32,6 +39,10 @@ func (s *Server) actorsState(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, detail{err.Error()})
 		return
 	}
+	lastActives := map[string]pool.IdleInfo{}
+	if s.pl != nil {
+		lastActives = s.pl.IdleEtas()
+	}
 	out := make([]actorView, 0, len(hs))
 	for _, h := range hs {
 		v := actorView{Name: h.Name}
@@ -39,6 +50,36 @@ func (s *Server) actorsState(w http.ResponseWriter, r *http.Request) {
 			ActorDetails(ctx context.Context, name string) (state, template, created string)
 		}); ok {
 			v.State, v.Template, v.Created = a.ActorDetails(r.Context(), h.Name)
+		}
+		if la, ok := lastActives[h.Name]; ok {
+			base := la.Time()
+			// An ETA in the past means the stored baseline predates the TTL
+			// (old rows): fall back to the creation-time cap instead of
+			// claiming an immediate purge.
+			suspend := base.Add(s.cfg.IdleTTL)
+			if suspend.Before(time.Now()) {
+				suspend = time.Time{}
+			} else if la.Tracked {
+				v.SuspendETA = suspend.UTC().Format(time.RFC3339)
+			}
+			v.LastActive = base.UTC().Format(time.RFC3339)
+			purge := base.Add(s.cfg.DeleteIdleTTL)
+			if v.Created != "" {
+				if created, err := time.Parse(time.RFC3339, v.Created); err == nil {
+					if cap := created.Add(s.cfg.MaxAge); cap.Before(purge) {
+						purge = cap
+					}
+				}
+			}
+			if purge.Before(time.Now()) && v.Created != "" {
+				if created, err := time.Parse(time.RFC3339, v.Created); err == nil {
+					purge = created.Add(s.cfg.MaxAge)
+				}
+			}
+			if !purge.Before(time.Now()) {
+				v.PurgeETA = purge.UTC().Format(time.RFC3339)
+			}
+			v.Live = time.Since(base) < time.Minute
 		}
 		out = append(out, v)
 	}

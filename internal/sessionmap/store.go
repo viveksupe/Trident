@@ -20,6 +20,7 @@ type Entry struct {
 	ChatID    string    `json:"chat_id"`
 	ActorName string    `json:"actor_name"`
 	CreatedAt time.Time `json:"created_at"`
+	LastSeen  time.Time `json:"last_seen"` // zero when never recorded
 }
 
 // Key renders the sqlite primary key.
@@ -56,6 +57,9 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("sessionmap schema: %w", err)
 		}
 	}
+	// last_active: added in-flight to power the console's purge/suspend ETAs;
+	// fails benignly when the column already exists.
+	_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN last_active INTEGER`)
 	return &Store{db: db}, nil
 }
 
@@ -84,6 +88,15 @@ func (s *Store) Delete(key model.RouteKey) error {
 	return err
 }
 
+// SetLastSeen records the latest activity for key (drives console ETAs).
+func (s *Store) SetLastSeen(key model.RouteKey, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE sessions SET last_active=? WHERE user_id=? AND chat_id=?`,
+		at.UnixNano(), key.UserID, key.ChatID)
+	return err
+}
+
 // LatestActor returns the actor mapping for key, if any.
 func (s *Store) LatestActor(key model.RouteKey) (string, bool, error) {
 	s.mu.Lock()
@@ -104,7 +117,7 @@ func (s *Store) LatestActor(key model.RouteKey) (string, bool, error) {
 func (s *Store) All() (map[model.RouteKey]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT user_id,chat_id,actor_name,created_at FROM sessions`)
+	rows, err := s.db.Query(`SELECT user_id,chat_id,actor_name,created_at,COALESCE(last_active,0) FROM sessions`)
 	if err != nil {
 		return nil, err
 	}
@@ -112,11 +125,14 @@ func (s *Store) All() (map[model.RouteKey]Entry, error) {
 	out := map[model.RouteKey]Entry{}
 	for rows.Next() {
 		var e Entry
-		var createdNano int64
-		if err := rows.Scan(&e.UserID, &e.ChatID, &e.ActorName, &createdNano); err != nil {
+		var createdNano, lastNano int64
+		if err := rows.Scan(&e.UserID, &e.ChatID, &e.ActorName, &createdNano, &lastNano); err != nil {
 			return nil, err
 		}
 		e.CreatedAt = time.Unix(0, createdNano)
+		if lastNano > 0 {
+			e.LastSeen = time.Unix(0, lastNano)
+		}
 		out[model.RouteKey{UserID: e.UserID, ChatID: e.ChatID}] = e
 	}
 	return out, rows.Err()
