@@ -263,6 +263,21 @@ func (i IdleInfo) Time() time.Time {
 	return i.LastSeen
 }
 
+// Seed hydrates supervision for a route whose actor already exists in the
+// backend but has not been requested yet in this shim process: it joins the
+// idle sweep with the restart moment as its activity baseline (its old
+// WebSocket died with the previous process, so a prompt suspend is safe —
+// the snapshot preserves the session).
+func (p *Pool) Seed(ctx context.Context, key model.RouteKey, handle *backend.Handle) {
+	found, inflight, err := p.Acquire(ctx, key)
+	if err != nil {
+		p.log.Debug("seed skipped (not ready)", "key", key.LogString(), "err", err)
+		return
+	}
+	_ = found
+	inflight.Done()
+}
+
 // IdleEtas maps actor name → last known activity: in-memory sessions first,
 // otherwise the persisted row (survives shim restarts).
 func (p *Pool) IdleEtas() map[string]IdleInfo {

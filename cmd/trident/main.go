@@ -213,7 +213,7 @@ func serveCmd(log *slog.Logger) error {
 	if egressManager != nil {
 		eflow = egressManager
 	}
-	if err := reconcileOnRestart(ctx, log, backendImpl, store, eflow); err != nil {
+	if err := reconcileOnRestart(ctx, log, backendImpl, store, eflow, pl); err != nil {
 		log.Warn("restart reconciliation failed (continuing)", "err", err)
 	}
 
@@ -297,7 +297,7 @@ type egressPurger interface {
 // longer exist in the backend (deleted externally or expired) and reports
 // actors that are still live. Actor names are derived deterministically from
 // the route key, so surviving mappings need no migration.
-func reconcileOnRestart(ctx context.Context, log *slog.Logger, backendImpl backend.Backend, store *sessionmap.Store, eflow egressPurger) error {
+func reconcileOnRestart(ctx context.Context, log *slog.Logger, backendImpl backend.Backend, store *sessionmap.Store, eflow egressPurger, pl *pool.Pool) error {
 	all, err := store.All()
 	if err != nil || len(all) == 0 {
 		return err
@@ -319,6 +319,13 @@ func reconcileOnRestart(ctx context.Context, log *slog.Logger, backendImpl backe
 		}
 	}
 	log.Info("session map reconciled", "kept", len(keep), "pruned", len(all)-len(keep))
+	// Hydrate supervision for actors that exist but have not been requested
+	// in this process yet — otherwise they escape the idle sweep and run
+	// forever. The restart moment is the activity baseline (the old browser
+	// WebSocket died with the previous shim).
+	for key, entry := range keep {
+		pl.Seed(ctx, key, &backend.Handle{Name: entry.ActorName, CreatedAt: entry.CreatedAt})
+	}
 	// Egress bookkeeping for actors the backend no longer has: purge it at
 	// startup too (TTL deletes that happened while the shim was down).
 	if eflow != nil {
