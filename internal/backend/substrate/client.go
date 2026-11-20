@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -154,32 +156,83 @@ func bearerTokenDialOption(ctx context.Context, clientset kubernetes.Interface, 
 		if token == "" {
 			return nil, fmt.Errorf("token file %q is empty", tokenFile)
 		}
-		return grpc.WithPerRPCCredentials(staticToken(token)), nil
+		return grpc.WithPerRPCCredentials(staticBearer(token)), nil
 	}
-	expirationSeconds := int64(3600)
-	tokenRequest := &authv1.TokenRequest{
-		Spec: authv1.TokenRequestSpec{
-			Audiences:         []string{apiHost},
-			ExpirationSeconds: &expirationSeconds,
-		},
-	}
-	token, err := clientset.CoreV1().ServiceAccounts(systemNamespace).CreateToken(ctx, clientSA, tokenRequest, metav1.CreateOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("request ateapi bearer token for SA %s/%s: %w", systemNamespace, clientSA, err)
-	}
-	if token.Status.Token == "" {
-		return nil, fmt.Errorf("ateapi bearer token response was empty")
-	}
-	return grpc.WithPerRPCCredentials(staticToken(token.Status.Token)), nil
+	// Long-running shims outlive a token minted at startup: the credential
+	// re-mints itself whenever a call needs a token within 5 minutes of
+	// expiry (a "long-lived shim" was silently bricked by the fixed 1 h
+	// token in an earlier version).
+	return grpc.WithPerRPCCredentials(&saTokenCreds{
+		clientset:  clientset,
+		namespace:  systemNamespace,
+		sa:         clientSA,
+		audience:   apiHost,
+		expiration: 3600,
+	}), nil
 }
 
-// staticToken is a bearer-token gRPC credential.
-type staticToken string
+// staticBearer is an immutable bearer-token gRPC credential (token files).
+type staticBearer string
 
-func (c staticToken) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
+func (c staticBearer) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
 	if c == "" {
 		return nil, fmt.Errorf("bearer token is empty")
 	}
 	return map[string]string{"authorization": "Bearer " + string(c)}, nil
 }
-func (c staticToken) RequireTransportSecurity() bool { return true }
+func (c staticBearer) RequireTransportSecurity() bool { return true }
+
+// saTokenCreds is a refreshing bearer credential: keeps a SA-minted token
+// alive for the life of the process.
+type saTokenCreds struct {
+	mu         sync.Mutex
+	clientset  kubernetes.Interface
+	namespace  string
+	sa         string
+	audience   string
+	expiration int64
+
+	token   string
+	expires time.Time
+}
+
+func (c *saTokenCreds) mint(ctx context.Context) (string, time.Time, error) {
+	expirationSeconds := int64(3600)
+	tr := &authv1.TokenRequest{
+		Spec: authv1.TokenRequestSpec{
+			Audiences:         []string{c.audience},
+			ExpirationSeconds: &expirationSeconds,
+		},
+	}
+	token, err := c.clientset.CoreV1().ServiceAccounts(c.namespace).CreateToken(ctx, c.sa, tr, metav1.CreateOptions{})
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("request ateapi bearer token for SA %s/%s: %w", c.namespace, c.sa, err)
+	}
+	if token.Status.Token == "" {
+		return "", time.Time{}, fmt.Errorf("ateapi bearer token response was empty")
+	}
+	return token.Status.Token, time.Now().Add(time.Duration(expirationSeconds) * time.Second), nil
+}
+
+func (c *saTokenCreds) fresh(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.token != "" && time.Until(c.expires) > 5*time.Minute {
+		return c.token, nil
+	}
+	token, expiresAt, err := c.mint(ctx)
+	if err != nil {
+		return "", err
+	}
+	c.token, c.expires = token, expiresAt
+	return token, nil
+}
+
+func (c *saTokenCreds) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
+	token, err := c.fresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"authorization": "Bearer " + token}, nil
+}
+func (c *saTokenCreds) RequireTransportSecurity() bool { return true }
