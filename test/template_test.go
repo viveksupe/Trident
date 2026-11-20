@@ -52,8 +52,8 @@ func TestRenderedActorTemplateStrictParses(t *testing.T) {
 	if !foundDurable {
 		t.Fatalf("no durable_dir volume")
 	}
-	if n := tmpl.GetResources().GetLimits().GetCpuMillicores(); n != 2000 {
-		t.Fatalf("bad cpu limit: %d", n)
+	if n := tmpl.GetResources().GetLimits().GetCpuMillicores(); n != 1000 {
+		t.Fatalf("bad cpu limit (want 1000): %d", n)
 	}
 	if tmpl.GetWorkerSelector().GetMatchLabels()["workload"] != "ot-terminal" {
 		t.Fatalf("bad worker selector: %v", tmpl.GetWorkerSelector())

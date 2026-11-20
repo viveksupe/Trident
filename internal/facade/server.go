@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 
 	"github.com/viveksupe/Trident/internal/backend"
 	"github.com/viveksupe/Trident/internal/config"
@@ -32,11 +33,12 @@ type Server struct {
 	log     *slog.Logger
 	egress  *egress.Manager // nil unless the egress approval flow is enabled
 	backend backend.Backend // for the console's actor maintenance panel
+	specs   *specCache      // cached terminal /openapi.json per template
 }
 
 // New builds the facade server.
 func New(cfg *config.Config, pl *pool.Pool, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, pl: pl, log: log}
+	return &Server{cfg: cfg, pl: pl, log: log, specs: newSpecCache(filepath.Dir(cfg.StateDB))}
 }
 
 // SetEgress attaches the approval manager (nil-able); call before Handler.
@@ -65,7 +67,12 @@ func (s *Server) Handler() http.Handler {
 	// terminal connections WITHOUT the bearer key (only headers it already
 	// sends, e.g. X-User-Id); open-terminal serves its docs/public paths
 	// unauthenticated, so these pass through with no auth check either.
-	for _, p := range []string{"GET /openapi.json", "GET /docs", "GET /redoc"} {
+	// The spec fetch is served from the template cache first (no actor needed
+	// for a static JSON doc); docs/redoc still proxy as before.
+	mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		s.serveSpec(w, r)
+	})
+	for _, p := range []string{"GET /docs", "GET /redoc"} {
 		mux.HandleFunc(p, s.routeNoAuth)
 	}
 

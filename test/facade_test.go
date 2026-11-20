@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,9 +80,12 @@ func (f *fakeBackend) ListReady(ctx context.Context) ([]backend.Handle, error) {
 	return nil, nil
 }
 
-func newTestConfig() *config.Config {
+func newTestConfig(t *testing.T) *config.Config {
+	t.Helper()
 	return &config.Config{
 		APIKey: "test-key", ActorAPIKey: "test-key", Features: config.DefaultFeatures(),
+		// Isolated dir: the spec cache persists per template next to the DB.
+		StateDB: filepath.Join(t.TempDir(), "sessions.db"),
 	}
 }
 
@@ -91,7 +95,7 @@ func newFacade(t *testing.T) (*fakeBackend, *httptest.Server) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	pl := pool.New(backendImpl, nil, log, time.Minute, time.Hour, time.Hour)
 	pl.AllowSuspend = false
-	s := facade.New(newTestConfig(), pl, log)
+	s := facade.New(newTestConfig(t), pl, log)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 	return backendImpl, srv
