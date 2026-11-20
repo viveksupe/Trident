@@ -47,7 +47,8 @@ containers:
     mountPath: /home/user
   - name: meta
     mountPath: /mnt/ots
-# Sandbox size: the open-terminal python server plus one Node-based agent CLI
+# Sandbox size: ~1 CPU / 2Gi covers the open-terminal python server plus one
+# Node-based agent CLI (substrate demo-verified); spikes during tool runs fit.
 # at a time run several hundred MB and spike while tools run.
 resources:
   limits:

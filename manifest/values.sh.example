@@ -41,7 +41,7 @@ export EGRESS_HOSTS="api.anthropic.com,api.openai.com,sentry.io,pypi.org,files.p
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
-# Worker pool.
+# Worker pool (one worker holds one actor: actor 1 CPU / 2Gi + overhead).
 export WORKERPOOL_REPLICAS="3"
-export WORKERPOOL_CPU="2"
-export WORKERPOOL_MEMORY="4608Mi"
+export WORKERPOOL_CPU="1"
+export WORKERPOOL_MEMORY="2560Mi"

@@ -84,8 +84,8 @@ func renderTemplate(manifest string, cfg *config.Config, image string) string {
 		{"${ANTHROPIC_API_KEY}", os.Getenv("ANTHROPIC_API_KEY")},
 		{"${OPENAI_API_KEY}", os.Getenv("OPENAI_API_KEY")},
 		{"${ACTOR_PORT}", fmt.Sprintf("%d", cfg.ActorPort)},
-		{"${CPU_MILLICORES}", envDefault("TRI_CPU_MILLICORES", "2000")},
-		{"${MEMORY_BYTES}", envDefault("TRI_MEMORY_BYTES", "4294967296")},
+		{"${CPU_MILLICORES}", envDefault("TRI_CPU_MILLICORES", "1000")},
+		{"${MEMORY_BYTES}", envDefault("TRI_MEMORY_BYTES", "2147483648")},
 		{"${EGRESS_CALLBACK}", cfg.EgressCallback},
 	}
 	for _, r := range replacements {
