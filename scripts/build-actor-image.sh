@@ -31,5 +31,5 @@ Actor image built:
   tag:    ${REPO}:${TAG}
   digest: ${FULL_REF}
 
-Use with: ot-shim bootstrap -image ${FULL_REF}
+Use with: trident bootstrap -image ${FULL_REF}
 EOF

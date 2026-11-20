@@ -1,4 +1,4 @@
-// ot-shim actor preload: reports blocked name lookups (EAI_NONAME) from any
+// trident actor preload: reports blocked name lookups (EAI_NONAME) from any
 // dynamically-linked process in the sandbox — curl, the agents' node CLIs,
 // python — by appending to a local report file that the shim sweeps through
 // the proxied /execute channel. Unlisted names fail at the in-sandbox

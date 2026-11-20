@@ -39,22 +39,22 @@ func (s *Server) writeConsolePage(w http.ResponseWriter, html string) {
 }
 
 const helperScript = `#!/bin/sh
-# ots-egress-request <hostname> [reason] — ask the human to allow egress.
-# usage: curl -s http://OT-SHIM-CALLBACK/_ots/egress/helper.sh | sh -s -- example.com
+# tri-egress-request <hostname> [reason] — ask the human to allow egress.
+# usage: curl -s http://OT-SHIM-CALLBACK/_tri/egress/helper.sh | sh -s -- example.com
 set -u
 host="$1"; [ -n "${2:-}" ] && reason="$2" || reason=""
-case "$host" in ""|-h|--help) echo "usage: ots-egress-request <hostname> [reason]" >&2; exit 2;; esac
+case "$host" in ""|-h|--help) echo "usage: tri-egress-request <hostname> [reason]" >&2; exit 2;; esac
 # The shim renders its own callback address here when it serves this helper;
 # an TRI_EGRESS_CALLBACK env var in the actor overrides it.
 svc="${TRI_EGRESS_CALLBACK:-%%CB%%}"
 actor="$(hostname 2>/dev/null || echo unknown)"
 body=$(printf '{"actor":"%s","host":"%s","reason":"%s"}' "$actor" "$host" "$reason")
-resp=$(curl -k -sS -X POST "https://$svc/_ots/egress/request" -H "Content-Type: application/json" --data "$body") || exit 1
+resp=$(curl -k -sS -X POST "https://$svc/_tri/egress/request" -H "Content-Type: application/json" --data "$body") || exit 1
 id=$(printf '%s' "$resp" | jq -r .id 2>/dev/null) || exit 1
 [ "$id" != "null" ] && [ -n "$id" ] || { echo "$resp" >&2; exit 1; }
 echo "egress request #$id for '$host' submitted — waiting for approval (Ctrl-C cancels this wait only)" >&2
 while true; do
-  status=$(curl -k -sS "https://$svc/_ots/egress/request/$id" | jq -r .status) || exit 1
+  status=$(curl -k -sS "https://$svc/_tri/egress/request/$id" | jq -r .status) || exit 1
   case "$status" in
     approved)  echo "approved — retry your connection now"; exit 0 ;;
     denied)    echo "denied by the human operator" >&2; exit 1 ;;
@@ -73,25 +73,25 @@ func (s *Server) RegisterEgress(mux *http.ServeMux) {
 	// Actor-side callbacks: no bearer auth (reachable only via the callback
 	// rule inside the actor's egress policy; actor claims are validated by
 	// the manager against the substrate control plane).
-	mux.HandleFunc("GET /_ots/egress/helper.sh", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /_tri/egress/helper.sh", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		rendered := strings.ReplaceAll(helperScript, "%%CB%%", s.cfg.EgressCallback)
 		_, _ = w.Write([]byte(rendered))
 	})
-	mux.HandleFunc("POST /_ots/egress/request", s.egressRequest)
+	mux.HandleFunc("POST /_tri/egress/request", s.egressRequest)
 	// The actor-side DNS-failure reporter (LD_PRELOAD hook) uses the same
 	// payload shape; reason distinguishes the source.
-	mux.HandleFunc("POST /_ots/egress/dns-hit", s.egressRequest)
-	mux.HandleFunc("GET /_ots/egress/request/{id}", s.egressRequestStatus)
+	mux.HandleFunc("POST /_tri/egress/dns-hit", s.egressRequest)
+	mux.HandleFunc("GET /_tri/egress/request/{id}", s.egressRequestStatus)
 
 	// Human console: Bearer-token (LAN-reachable by design).
 	// Compat: pre-rename console bookmarks keep working.
 	for _, legacy := range []struct{ from, to string }{
-		{"/_ots/console/egress", "/_trident/console/egress"},
-		{"/_ots/console/actors", "/_trident/console/actors"},
+		{"/_tri/console/egress", "/_trident/console/egress"},
+		{"/_tri/console/actors", "/_trident/console/actors"},
 	} {
 		mux.HandleFunc("GET "+legacy.from, func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, strings.Replace(r.URL.Path, "/_ots/console", "/_trident/console", 1), http.StatusFound)
+			http.Redirect(w, r, strings.Replace(r.URL.Path, "/_tri/console", "/_trident/console", 1), http.StatusFound)
 		})
 		to := legacy.to
 		page := egressConsoleHTML
