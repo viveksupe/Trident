@@ -189,12 +189,11 @@ func serveCmd(log *slog.Logger) error {
 					return
 				case <-t.C:
 					for _, key := range pl.LiveKeys() {
-						sess, inflight, err := pl.Acquire(ctx, key)
-						if err != nil {
+						handle, tracked := pl.AcquireForSweep(key)
+						if !tracked {
 							continue
 						}
-						lines, err := sweeper.SweepReports(ctx, &sess.Handle)
-						inflight.Done()
+						lines, err := sweeper.SweepReports(ctx, &handle)
 						if err != nil {
 							continue
 						}

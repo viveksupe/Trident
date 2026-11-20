@@ -263,6 +263,21 @@ func (i IdleInfo) Time() time.Time {
 	return i.LastSeen
 }
 
+// AcquireForSweep is the report-sweeper's read path: it serves already-ready
+// actors WITHOUT counting chat activity (no lastActive touch — otherwise the
+// sweeps keep every actor forever "live" and idle suspension never fires) and
+// without resuming suspended ones (their pending reports wait for the next
+// real touch).
+func (p *Pool) AcquireForSweep(key model.RouteKey) (backend.Handle, bool) {
+	p.mu.Lock()
+	ses, ok := p.ses[key]
+	p.mu.Unlock()
+	if !ok || ses.handle == nil {
+		return backend.Handle{}, false
+	}
+	return *ses.handle, true
+}
+
 // Seed hydrates supervision for a route whose actor already exists in the
 // backend but has not been requested yet in this shim process: it joins the
 // idle sweep with the restart moment as its activity baseline (its old
