@@ -3,7 +3,6 @@ package substrate
 
 import (
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -21,5 +20,3 @@ func NewKubeClient(kubeconfigPath string) (*kubernetes.Clientset, error) {
 func LogOptionsFor(sinceSeconds int64) *corev1.PodLogOptions {
 	return &corev1.PodLogOptions{SinceSeconds: &sinceSeconds}
 }
-
-var _ = v1.NamespaceAll

@@ -15,12 +15,16 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// session is one live mapping entry.
+// session is one live mapping entry. lock ordering: life (per session) THEN
+// mu (pool) — Acquire routes through life, the sweep takes life before its
+// substrate call, so neither can hold both with the outer mutex first.
 type session struct {
 	handle     *backend.Handle
 	dialer     backend.Dialer
 	lastActive time.Time
 	inflight   int64 // open HTTP requests (incl. spliced WS); suspend waits for zero
+	sweeping   bool  // a suspend/delete is running; Acquire waits for it
+	life       sync.Mutex
 }
 
 // Pool reconciles route keys to backend actors.
@@ -45,6 +49,10 @@ type Pool struct {
 	mu  sync.Mutex
 	ses map[model.RouteKey]*session
 	now func() time.Time
+	// lastSeenDirty buffers activity timestamps flushed to sqlite in one
+	// batch per sweep tick — per-request writes under the pool mutex
+	// serialized every request behind disk I/O.
+	lastSeenDirty map[model.RouteKey]time.Time
 }
 
 // New constructs a pool. store may be nil (in-memory only, no restart persistence).
@@ -54,6 +62,7 @@ func New(b backend.Backend, store *sessionmap.Store, log *slog.Logger, idleTTL, 
 		idleTTL: idleTTL, deleteIdleTTL: deleteIdleTTL, maxAge: maxAge,
 		AllowSuspend: true, WarmWindow: 5 * time.Second,
 		ses: map[model.RouteKey]*session{}, now: time.Now,
+		lastSeenDirty: map[model.RouteKey]time.Time{},
 	}
 }
 
@@ -63,77 +72,165 @@ type Ready struct {
 	Dialer backend.Dialer
 }
 
+// hold waits out any in-flight lifecycle op on the session registered for
+// key and returns it with sess.life held (nil when none is registered).
+// Callers must release life and re-establish any assumptions after the
+// backend call — the sweep may have replaced or removed the entry meanwhile.
+func (p *Pool) hold(key model.RouteKey) *session {
+	for {
+		p.mu.Lock()
+		ses := p.ses[key]
+		p.mu.Unlock()
+		if ses == nil {
+			return nil
+		}
+		ses.life.Lock()
+		p.mu.Lock()
+		cur := p.ses[key]
+		if cur == ses && !ses.sweeping {
+			p.mu.Unlock()
+			return ses
+		}
+		p.mu.Unlock()
+		ses.life.Unlock() // replaced or swept away while we waited: retry
+	}
+}
+
 // Acquire ensures the actor for key is ready and registers an in-flight request.
 // The returned inflight must hit Done() when the request (or spliced WS) ends.
 func (p *Pool) Acquire(ctx context.Context, key model.RouteKey) (Ready, *Inflight, error) {
-	v, err, _ := p.sf.Do(key.LogString(), func() (any, error) {
-		return p.ensure(ctx, key)
-	})
+	ses, err := p.acquireSession(ctx, key)
 	if err != nil {
 		return Ready{}, nil, err
 	}
-	ses := v.(*session)
-
-	p.mu.Lock()
-	ses.lastActive = p.now()
-	if p.store != nil {
-		_ = p.store.SetLastSeen(key, ses.lastActive)
-	}
-	ses.inflight++
-	p.mu.Unlock()
 
 	inf := &Inflight{onDone: func() {
+		now := p.now()
 		p.mu.Lock()
 		ses.inflight--
-		ses.lastActive = p.now()
-		if p.store != nil {
-			_ = p.store.SetLastSeen(key, ses.lastActive)
-		}
+		ses.lastActive = now
+		p.lastSeenDirty[key] = now
 		p.mu.Unlock()
 	}}
 	return Ready{Handle: *ses.handle, Dialer: ses.dialer}, inf, nil
 }
 
-// ensure returns the session, verifying/warming the actor in the backend when
-// the last known-active point is stale.
-func (p *Pool) ensure(ctx context.Context, key model.RouteKey) (*session, error) {
-	p.mu.Lock()
-	ses, ok := p.ses[key]
-	warm := ok && p.now().Sub(ses.lastActive) < p.WarmWindow
-	p.mu.Unlock()
+// acquireSession resolves the session and registers this caller's refcount.
+// Every caller attaches AFTER the (shared) ensure returns — singleflight's
+// "shared" flag is true for the executor too when others joined, so the
+// leader cannot be told apart that way.
+func (p *Pool) acquireSession(ctx context.Context, key model.RouteKey) (*session, error) {
+	for {
+		// Detached: the leader's ctx must not kill the ensure for waiters,
+		// and the two-segment key (user + chat) is joined unambiguously —
+		// "a/b"+"c" and "a"+"b/c" must not share a singleflight bucket
+		// (that handed one caller the OTHER key's session).
+		v, err, _ := p.sf.Do(key.SfKey(), func() (any, error) {
+			return p.ensure(context.WithoutCancel(ctx), key)
+		})
+		if err != nil {
+			return nil, err
+		}
+		ses := v.(*session)
+		if p.attach(key, ses) {
+			return ses, nil
+		}
+		// The session lost the map slot between ensure and attach (a sweep
+		// won the lifecycle lock first): run a fresh ensure — EnsureReady
+		// resumes or recreates the actor.
+	}
+}
 
-	if warm {
-		return ses, nil
+// attach registers a caller's refcount under the session's lifecycle lock.
+// False means the session lost the map slot (swept/purged meanwhile) and the
+// caller must re-acquire.
+func (p *Pool) attach(key model.RouteKey, ses *session) bool {
+	for {
+		ses.life.Lock()
+		p.mu.Lock()
+		if cur := p.ses[key]; cur != ses {
+			p.mu.Unlock()
+			ses.life.Unlock()
+			return false
+		}
+		if !ses.sweeping {
+			ses.inflight++
+			ses.lastActive = p.now()
+			p.lastSeenDirty[key] = ses.lastActive
+			p.mu.Unlock()
+			ses.life.Unlock()
+			return true
+		}
+		p.mu.Unlock()
+		ses.life.Unlock()
+		// A suspend/delete is running on this session; wait it out. Its
+		// completion drops the map slot and the caller's next ensure
+		// resumes or recreates the actor.
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// ensure returns the session (life NOT held — callers attach afterwards),
+// verifying/warming the actor in the backend when the last known-active
+// point is stale. life is held only across the backend interaction, so a
+// concurrent sweep cannot act mid-ensure; the attach step afterwards either
+// lands on this session or the caller retries through a fresh ensure.
+func (p *Pool) ensure(ctx context.Context, key model.RouteKey) (*session, error) {
+	ses := p.hold(key)
+	if ses != nil && ses.dialer != nil && p.now().Sub(ses.lastActive) < p.WarmWindow {
+		ses.life.Unlock()
+		return ses, nil // warm
+	}
+	if ses == nil {
+		// Create-and-hold under the outer mutex; if a concurrent ensure won
+		// the slot in the meantime, restart through the normal hold path.
+		ses = &session{lastActive: p.now()}
+		ses.life.Lock()
+		p.mu.Lock()
+		if existing := p.ses[key]; existing != nil {
+			p.mu.Unlock()
+			ses.life.Unlock()
+			return p.ensure(ctx, key)
+		}
+		p.ses[key] = ses
+		p.mu.Unlock()
 	}
 
 	h, dialer, err := p.backend.EnsureReady(ctx, key)
 	if err != nil {
-		if ok {
+		if ses.handle != nil {
 			// Keep serving the warm-but-stale session: if the actor is truly
 			// dead the proxied request surfaces it.
 			p.log.Warn("backend EnsureReady failed; keeping last-known session",
 				"key", key.LogString(), "err", err)
+			ses.life.Unlock()
 			return ses, nil
 		}
+		p.mu.Lock()
+		if p.ses[key] == ses {
+			delete(p.ses, key)
+		}
+		p.mu.Unlock()
+		ses.life.Unlock()
 		return nil, fmt.Errorf("actor not ready: %w", err)
 	}
 
 	p.mu.Lock()
-	if ok {
-		ses.handle, ses.dialer = h, dialer
-		p.mu.Unlock()
-		return ses, nil
+	if p.ses[key] != ses {
+		// The slot was freed under us (console purge forgets without the
+		// lifecycle lock): re-register; EnsureReady recreated the actor.
+		p.ses[key] = ses
 	}
-	ses = &session{handle: h, dialer: dialer, lastActive: p.now()}
-	p.ses[key] = ses
+	ses.handle, ses.dialer = h, dialer
+	ses.lastActive = p.now()
 	p.mu.Unlock()
-
 	if p.store != nil {
 		_ = p.store.Put(sessionmap.Entry{
 			UserID: key.UserID, ChatID: key.ChatID, ActorName: h.Name,
 			CreatedAt: h.CreatedAt,
 		})
 	}
+	ses.life.Unlock()
 	return ses, nil
 }
 
@@ -141,16 +238,12 @@ func (p *Pool) ensure(ctx context.Context, key model.RouteKey) (*session, error)
 // exactly once to release the refcount.
 type Inflight struct {
 	onDone func()
-	done   bool
+	once   sync.Once
 }
 
-// Done releases the in-flight refcount.
-func (i *Inflight) Done() {
-	if !i.done {
-		i.done = true
-		i.onDone()
-	}
-}
+// Done releases the in-flight refcount (idempotent; a late extra call is a
+// no-op rather than a data race).
+func (i *Inflight) Done() { i.once.Do(i.onDone) }
 
 // RunTicker reconciles lifecycle every interval: suspend idle sessions (only if
 // AllowSuspend), delete max-age sessions. Blocking; call it in a goroutine.
@@ -163,68 +256,136 @@ func (p *Pool) RunTicker(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 			p.sweep(ctx)
+			p.flushLastSeen()
 		}
+	}
+}
+
+// flushLastSeen persists buffered activity timestamps outside the pool mutex.
+func (p *Pool) flushLastSeen() {
+	if p.store == nil {
+		return
+	}
+	p.mu.Lock()
+	if len(p.lastSeenDirty) == 0 {
+		p.mu.Unlock()
+		return
+	}
+	dirty := p.lastSeenDirty
+	p.lastSeenDirty = map[model.RouteKey]time.Time{}
+	p.mu.Unlock()
+	if err := p.store.SetLastSeenBatch(dirty); err != nil {
+		p.log.Debug("last-seen flush failed", "err", err)
 	}
 }
 
 func (p *Pool) sweep(ctx context.Context) {
 	now := p.now()
 	type victim struct {
-		key    model.RouteKey
-		handle *backend.Handle
+		key model.RouteKey
+		ses *session
+		// mode: max-age or long-idle → full delete; short idle → suspend
 		remove bool
 	}
 	var toSweep []victim
 
 	p.mu.Lock()
 	for key, ses := range p.ses {
-		// Never touch sessions with in-flight requests (HTTP or spliced WS).
-		if ses.inflight > 0 {
+		// Never touch sessions with in-flight requests (HTTP or spliced WS)
+		// or ones already being swept by a concurrent pass.
+		if ses.inflight > 0 || ses.sweeping {
 			continue
 		}
+		var victimReason string
 		switch {
 		case now.Sub(ses.handle.CreatedAt) > p.maxAge:
-			p.log.Info("deleting expired actor", "key", key.LogString(), "actor", ses.handle.Name)
-			toSweep = append(toSweep, victim{key, ses.handle, true})
+			victimReason = "deleting expired actor"
+			toSweep = append(toSweep, victim{key, ses, true})
 		case p.AllowSuspend && now.Sub(ses.lastActive) > p.deleteIdleTTL:
 			// Idle past the delete TTL (deleted chats, abandoned sessions):
 			// full delete frees the durable volume.
-			p.log.Info("deleting long-idle actor", "key", key.LogString(), "actor", ses.handle.Name,
-				"idle", now.Sub(ses.lastActive))
-			toSweep = append(toSweep, victim{key, ses.handle, true})
+			victimReason = "deleting long-idle actor"
+			toSweep = append(toSweep, victim{key, ses, true})
 		case p.AllowSuspend && now.Sub(ses.lastActive) > p.idleTTL:
-			p.log.Info("suspending idle actor", "key", key.LogString(), "actor", ses.handle.Name,
-				"idle", now.Sub(ses.lastActive))
-			toSweep = append(toSweep, victim{key, ses.handle, false})
+			victimReason = "suspending idle actor"
+			toSweep = append(toSweep, victim{key, ses, false})
+		default:
+			continue
 		}
+		ses.sweeping = true // blocks Acquire until the lifecycle op decides
+		p.log.Info(victimReason, "key", key.LogString(), "actor", ses.handle.Name,
+			"idle", now.Sub(ses.lastActive))
 	}
 	p.mu.Unlock()
 
 	for _, v := range toSweep {
-		ctxT, cancel := context.WithTimeout(ctx, 5*time.Minute)
-		var err error
-		if v.remove {
-			err = p.backend.Delete(ctxT, v.handle)
-			if err == nil && p.store != nil {
-				_ = p.store.Delete(v.key)
-			}
-			if err == nil && p.OnActorDeleted != nil {
-				p.OnActorDeleted(v.handle.Name)
-			}
-		} else {
-			err = p.backend.Suspend(ctxT, v.handle)
-			if err == nil {
-				p.log.Info("suspended idle actor", "actor", v.handle.Name)
-			}
-		}
-		if err != nil {
-			p.log.Warn("lifecycle sweep failed", "actor", v.handle.Name, "err", err)
-		}
-		cancel()
-		p.mu.Lock()
-		delete(p.ses, v.key)
-		p.mu.Unlock()
+		p.doSweep(ctx, v.key, v.ses, v.remove)
 	}
+}
+
+// doSweep performs one lifecycle op under the session's lifecycle lock: the
+// in-flight state is re-checked AFTER every concurrent Acquire (held inside
+// ensure until it registers its refcount) has finished, so a busy actor is
+// never suspended or deleted behind a request.
+func (p *Pool) doSweep(ctx context.Context, key model.RouteKey, ses *session, remove bool) {
+	ses.life.Lock()
+
+	p.mu.Lock()
+	busy := ses.inflight > 0
+	p.mu.Unlock()
+	if busy {
+		// A request slipped in between the pick and the lifecycle lock.
+		p.mu.Lock()
+		ses.sweeping = false
+		p.mu.Unlock()
+		ses.life.Unlock()
+		return
+	}
+
+	ctxT, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	var err error
+	var stillTracked bool
+	if remove {
+		err = p.backend.Delete(ctxT, ses.handle)
+		if err == nil {
+			// Purge the persisted row + egress bookkeeping only when the map
+			// slot still points at THIS session — a recreated actor (same
+			// key, fresh actor after the delete) must keep its bookkeeping.
+			p.mu.Lock()
+			stillTracked = p.ses[key] == ses
+			if stillTracked {
+				if p.store != nil {
+					_ = p.store.Delete(key)
+				}
+				delete(p.ses, key)
+			}
+			p.mu.Unlock()
+		}
+	} else {
+		err = p.backend.Suspend(ctxT, ses.handle)
+		if err == nil {
+			p.log.Info("suspended idle actor", "actor", ses.handle.Name)
+		}
+	}
+	cancel()
+	if err != nil {
+		p.log.Warn("lifecycle sweep failed", "actor", ses.handle.Name, "err", err)
+	}
+
+	// Drop the map slot when this pass still owns the key (for both suspend
+	// and delete: the next Acquire walks EnsureReady and resumes/recreates
+	// through the backend as before). The OnActorDeleted hook fires only
+	// when the bookkeeping was not adopted by a recreated actor.
+	p.mu.Lock()
+	if p.ses[key] == ses {
+		delete(p.ses, key)
+	}
+	if remove && err == nil && stillTracked && p.OnActorDeleted != nil {
+		p.OnActorDeleted(ses.handle.Name)
+	}
+	ses.sweeping = false
+	p.mu.Unlock()
+	ses.life.Unlock()
 }
 
 // ForgetByActorName drops the mapping for an actor (after its console-side
@@ -256,12 +417,7 @@ type IdleInfo struct {
 	Tracked  bool
 }
 
-func (i IdleInfo) Time() time.Time {
-	if i.Tracked {
-		return i.LastSeen
-	}
-	return i.LastSeen
-}
+func (i IdleInfo) Time() time.Time { return i.LastSeen }
 
 // AcquireForSweep is the report-sweeper's read path: it serves already-ready
 // actors WITHOUT counting chat activity (no lastActive touch — otherwise the
@@ -281,16 +437,23 @@ func (p *Pool) AcquireForSweep(key model.RouteKey) (backend.Handle, bool) {
 // Seed hydrates supervision for a route whose actor already exists in the
 // backend but has not been requested yet in this shim process: it joins the
 // idle sweep with the restart moment as its activity baseline (its old
-// WebSocket died with the previous process, so a prompt suspend is safe —
-// the snapshot preserves the session).
-func (p *Pool) Seed(ctx context.Context, key model.RouteKey, handle *backend.Handle) {
-	found, inflight, err := p.Acquire(ctx, key)
-	if err != nil {
-		p.log.Debug("seed skipped (not ready)", "key", key.LogString(), "err", err)
+// WebSocket died with the previous process, so a prompt idle suspend is safe
+// — the snapshot preserves the session). No EnsureReady call: seeding must
+// not resume every suspended actor at once (a thundering herd after a busy
+// restart); the first real request resumes on demand.
+func (p *Pool) Seed(_ context.Context, key model.RouteKey, handle *backend.Handle) {
+	p.mu.Lock()
+	if _, ok := p.ses[key]; ok {
+		p.mu.Unlock()
 		return
 	}
-	_ = found
-	inflight.Done()
+	// Pre-age the baseline past WarmWindow so the first real request walks
+	// EnsureReady (which populates the dialer) instead of serving a nil one.
+	baseline := p.now().Add(-p.WarmWindow - time.Second)
+	ses := &session{handle: handle, lastActive: baseline}
+	p.ses[key] = ses
+	p.lastSeenDirty[key] = baseline
+	p.mu.Unlock()
 }
 
 // IdleEtas maps actor name → last known activity: in-memory sessions first,

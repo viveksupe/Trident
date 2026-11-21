@@ -5,11 +5,50 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/viveksupe/Trident/internal/backend/substrate"
 )
 
+// maskSecret hides values of secret-shaped env names (template dumps used to
+// print provider API keys verbatim).
+func maskSecret(name, value string) string {
+	up := strings.ToUpper(name)
+	if strings.Contains(up, "KEY") || strings.Contains(up, "TOKEN") ||
+		strings.Contains(up, "SECRET") || strings.Contains(up, "PASSWORD") {
+		if value == "" {
+			return "<unset>"
+		}
+		return "<set, len " + fmt.Sprint(len(value)) + ">"
+	}
+	return value
+}
+
 func main() {
+	// Argument-count guard first: a missing atespace/actor used to panic on
+	// the os.Args index.
+	if len(os.Args) < 3 {
+		fmt.Println("usage: inspect-tmpl <cmd> <atespace> <name|actor> [extra]",
+			"\n  cmds: actors, delete, suspendall, cycle, migrate, policy, (default: dump template)")
+		os.Exit(2)
+	}
+	if os.Args[1] == "delete" && len(os.Args) < 4 {
+		fmt.Println("usage: inspect-tmpl delete <atespace> <actor>")
+		os.Exit(2)
+	}
+	if os.Args[1] == "cycle" && len(os.Args) < 4 {
+		fmt.Println("usage: inspect-tmpl cycle <atespace> <actor>")
+		os.Exit(2)
+	}
+	if os.Args[1] == "migrate" && len(os.Args) < 5 {
+		fmt.Println("usage: inspect-tmpl migrate <atespace> <actor> <callback>")
+		os.Exit(2)
+	}
+	if os.Args[1] == "policy" && len(os.Args) < 4 {
+		fmt.Println("usage: inspect-tmpl policy <atespace> <actor>")
+		os.Exit(2)
+	}
+
 	client, err := substrate.NewAPIClientForTest()
 	if err != nil {
 		fmt.Println("client:", err)
@@ -82,7 +121,7 @@ func main() {
 	for _, c := range t.GetContainers() {
 		fmt.Println("container:", c.GetName(), "image:", c.GetImage())
 		for _, e := range c.GetEnv() {
-			fmt.Println("  env:", e.GetName(), "=", e.GetValue())
+			fmt.Println("  env:", e.GetName(), "=", maskSecret(e.GetName(), e.GetValue()))
 		}
 		fmt.Println("  mounts:", len(c.GetVolumeMounts()))
 	}

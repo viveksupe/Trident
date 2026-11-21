@@ -93,21 +93,16 @@ func NewBackend(log *slog.Logger, cfg *config.Config) (backend.Backend, error) {
 		durability = ateapi.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS
 	}
 
-	callbackHost := ""
-	callbackPort := ""
-	if cfg.EgressCallback != "" {
-		callbackHost = callbackHostName(cfg.EgressCallback)
-		callbackPort = strings.TrimPrefix(cfg.EgressCallback[strings.LastIndex(cfg.EgressCallback, ":")+1:], ":")
-	}
-
+	// Callback host/port parse once in config.Validate (was re-parsed from
+	// two different string slices on three call paths).
 	return &Backend{
 		lc: &Lifecycle{
 			client:           client,
 			TemplateAtespace: cfg.TemplateAtespace(),
 			TemplateName:     cfg.TemplateName(),
 			EgressHosts:      cfg.EgressHosts,
-			CallbackHost:     callbackHost,
-			CallbackPort:     callbackPort,
+			CallbackHost:     cfg.CallbackHost,
+			CallbackPort:     cfg.CallbackPort,
 		},
 		dialer:      dialer,
 		atspace:     cfg.Atespace,
@@ -119,13 +114,7 @@ func NewBackend(log *slog.Logger, cfg *config.Config) (backend.Backend, error) {
 	}, nil
 }
 
-// callbackHostName splits "host[:port]" and returns the host part.
-func callbackHostName(cb string) string {
-	if i := strings.Index(cb, ":"); i >= 0 {
-		return cb[:i]
-	}
-	return cb
-}
+// callbackHostName was folded into config's once-only splitCallback.
 
 func envDefault(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
@@ -279,7 +268,10 @@ func (b *Backend) SweepReports(ctx context.Context, h *backend.Handle) ([]Report
 		},
 		Timeout: 30 * time.Second,
 	}
-	body := strings.NewReader(`{"command":"cat /tmp/.ot-egress/seen.jsonl 2>/dev/null && echo SWEEPMARK; : > /tmp/.ot-egress/seen.jsonl","cwd":"/home/user"}`)
+	// Read first, then (only after a successful read) clear: one command that
+	// truncates while reading loses the reports when the response is lost or
+	// unparseable.
+	body := strings.NewReader(`{"command":"cat /tmp/.ot-egress/seen.jsonl 2>/dev/null; echo SWEEPMARK","cwd":"/home/user"}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://actor/execute?wait=15", body)
 	if err != nil {
 		return nil, err
@@ -310,6 +302,7 @@ func (b *Backend) SweepReports(ctx context.Context, h *backend.Handle) ([]Report
 		text += o.Data
 	}
 	var lines []ReportLine
+	parsed := true
 	for _, l := range strings.Split(text, "\n") {
 		l = strings.TrimSpace(l)
 		if !strings.HasPrefix(l, "{") || strings.Contains(l, "SWEEPMARK") {
@@ -320,12 +313,27 @@ func (b *Backend) SweepReports(ctx context.Context, h *backend.Handle) ([]Report
 			Requestor string `json:"requestor"`
 		}
 		if json.Unmarshal([]byte(l), &rec) != nil || rec.Host == "" {
+			parsed = false
 			continue
 		}
 		lines = append(lines, ReportLine{
 			Actor: h.Name, Atespace: b.atspace,
 			Host: rec.Host, Requestor: rec.Requestor,
 		})
+	}
+	if !parsed {
+		// The file may hold more lines than the response carried; leave it
+		// for the next tick instead of truncating it on a bad read.
+		return lines, fmt.Errorf("sweep: partial read, report file left intact")
+	}
+	// Read + parse succeeded: clear the file in its own command.
+	if body2, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://actor/execute?wait=5",
+		strings.NewReader(`{"command":": > /tmp/.ot-egress/seen.jsonl","cwd":"/home/user"}`)); err == nil {
+		body2.Header.Set("Content-Type", "application/json")
+		body2.Header.Set("Authorization", "Bearer "+b.actorAPIKey)
+		if resp, err := client.Do(body2); err == nil {
+			_ = resp.Body.Close()
+		}
 	}
 	return lines, nil
 }
@@ -338,6 +346,9 @@ func (b *Backend) ActorDetails(ctx context.Context, name string) (state, templat
 	}
 	state = a.GetStatus().GetState().String()
 	template = a.GetActorTemplate().GetName()
+	if t := a.GetMetadata().GetCreateTime(); t != nil {
+		created = t.AsTime().UTC().Format(time.RFC3339)
+	}
 	return state, template, created
 }
 

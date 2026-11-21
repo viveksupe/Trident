@@ -38,10 +38,15 @@ type Store struct {
 
 // Open opens (creating if needed) the session map database.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open sessionmap: %w", err)
 	}
+	defer func() {
+		if db != nil {
+			_ = db.Close() // schema set-up failed: don't leak the handle
+		}
+	}()
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS sessions (
 			key BLOB PRIMARY KEY,
@@ -60,7 +65,9 @@ func Open(path string) (*Store, error) {
 	// last_active: added in-flight to power the console's purge/suspend ETAs;
 	// fails benignly when the column already exists.
 	_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN last_active INTEGER`)
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	db = nil // ownership transferred
+	return s, nil
 }
 
 // Close closes the database.
@@ -95,6 +102,35 @@ func (s *Store) SetLastSeen(key model.RouteKey, at time.Time) error {
 	_, err := s.db.Exec(`UPDATE sessions SET last_active=? WHERE user_id=? AND chat_id=?`,
 		at.UnixNano(), key.UserID, key.ChatID)
 	return err
+}
+
+// SetLastSeenBatch records several keys' latest activity in one transaction
+// (the pool buffers per-request activity and flushes it here, off the hot
+// path).
+func (s *Store) SetLastSeenBatch(entries map[model.RouteKey]time.Time) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`UPDATE sessions SET last_active=? WHERE user_id=? AND chat_id=?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for key, at := range entries {
+		if _, err := stmt.Exec(at.UnixNano(), key.UserID, key.ChatID); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	_ = stmt.Close()
+	return tx.Commit()
 }
 
 // LatestActor returns the actor mapping for key, if any.

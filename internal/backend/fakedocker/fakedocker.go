@@ -94,7 +94,8 @@ func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend
 	case err != nil:
 		args := []string{"run", "-d", "--name", name,
 			"--cpu-shares", "512",
-			"-p", b.ActorPort, // publish on a random 127.0.0.1 port
+			// Loopback only: dev actors must not be LAN-reachable.
+			"-p", "127.0.0.1::" + b.ActorPort,
 			"-e", "OPEN_TERMINAL_API_KEY=" + b.ActorAPIKey,
 		}
 		for _, kv := range b.Env {

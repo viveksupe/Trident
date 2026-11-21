@@ -59,6 +59,7 @@ func NewObserver(mgr *Manager, checker ActorChecker, clientset *kubernetes.Clien
 func (o *Observer) Tick(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
+	o.pruneSeen(now())
 	pods, err := o.clientset.CoreV1().Pods(o.ns).List(ctx, metav1.ListOptions{LabelSelector: o.filter})
 	if err != nil {
 		o.log.Debug("observer pod list failed", "err", err)
@@ -108,45 +109,95 @@ func (o *Observer) handle(ctx context.Context, d DenyLog) {
 	if !strings.HasPrefix(actor, o.mgr.ActorPrefix) {
 		return
 	}
-	if ok, err := o.check(ctx, atespace, actor); err != nil || !ok {
-		return
-	}
 	ip := destIP(d.Dest)
 	if ip == "" {
 		return
 	}
-	host := d.SNI
-	if host == "" {
-		host = ptrHost(ip) // reverse lookup; may be empty
-	}
-
-	key := actor + "|" + host + "|" + ip
-	o.mu.Lock()
-	if until, ok := o.seen[key]; ok && time.Now().Before(until) {
-		o.mu.Unlock()
+	// Dedup on the cheap key BEFORE the per-line control-plane GetActor and
+	// PTR lookup: one gateway deny log line used to cost both calls for
+	// every repeat.
+	key := actor + "|" + d.SNI + "|" + ip
+	if o.recentlySeen(key) {
 		return
 	}
-	o.seen[key] = time.Now().Add(o.cooldown)
-	o.mu.Unlock()
+	if ok, err := o.check(ctx, atespace, actor); err != nil || !ok {
+		return
+	}
+	host := d.SNI
+	if host == "" {
+		host = ptrWithCtx(ctx, ip) // reverse lookup; may be empty (bounded by the tick's timeout)
+	}
+	key = actor + "|" + host + "|" + ip
+	if o.recentlySeen(key) {
+		return
+	}
 
 	reason := fmt.Sprintf("blocked egress to %s (observed in gateway logs)", d.Dest)
 	if _, err := o.mgr.SubmitObserved(ctx, atespace, actor, host, ip, reason); err != nil {
 		o.log.Debug("observer submit skipped", "actor", actor, "host", host, "err", err)
 		return
 	}
+	// Cooldown after a successful submit (a failed one retries next tick).
+	o.rememberSeen(key)
 	o.log.Info("observed blocked egress", "actor", actor, "ip", ip, "host", host)
 }
 
+// recentlySeen reports the dedup key inside its cooldown window.
+func (o *Observer) recentlySeen(key string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	until, ok := o.seen[key]
+	return ok && now().Before(until)
+}
+
+// rememberSeen arms the dedup key for the cooldown.
+func (o *Observer) rememberSeen(key string) {
+	o.mu.Lock()
+	o.seen[key] = now().Add(o.cooldown)
+	o.mu.Unlock()
+}
+
+// pruneSeen drops cooldown keys older than the window (the map otherwise
+// grows without limit on distinct SNI/IP pairs an actor controls).
+func (o *Observer) pruneSeen(t time.Time) {
+	o.mu.Lock()
+	for key, until := range o.seen {
+		if !t.Before(until) {
+			delete(o.seen, key)
+		}
+	}
+	o.mu.Unlock()
+}
+
+func now() time.Time { return time.Now() }
+
 // SubmitObserved records a gateway-observed deny as a pending request. The
 // host may be empty (no SNI, no PTR) — the console then asks the human for
-// the allowlist name before opening it.
+// the allowlist name before opening it. Hosts an actor can influence
+// (SNI strings, PTR records) get the same strict-hostname validation the
+// helper path gets: a standing auto-approve rule must not be able to grant
+// "*" or a control-character host silently.
 func (m *Manager) SubmitObserved(ctx context.Context, atespace, actor, host, ip, reason string) (*Request, error) {
 	if host != "" {
 		host = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
-		if existing, err := m.store.PendingFor(actor, host); err == nil && len(existing) > 0 {
-			m.approvePendingIfAuto(ctx, &existing[0])
-			return &existing[0], nil
+		if !validHost(host) {
+			// Unresolvable/invalid observations pend with an empty host: the
+			// human supplies the name before any approval.
+			host = ""
 		}
+		if host != "" {
+			if existing, err := m.store.PendingFor(actor, host); err == nil && len(existing) > 0 {
+				m.approvePendingIfAuto(ctx, &existing[0])
+				return &existing[0], nil
+			}
+		}
+	}
+	if actor == "" || len(actor) > 128 {
+		return nil, fmt.Errorf("invalid actor %q", actor)
+	}
+	if n, err := m.store.PendingCountForActor(actor); err == nil && m.MaxPendingPerActor > 0 &&
+		n >= m.MaxPendingPerActor {
+		return nil, fmt.Errorf("actor %q has too many open egress requests", actor)
 	}
 	r := &Request{Atespace: atespace, ActorName: actor, Host: host, Reason: reason, Status: StatusPending}
 	if err := m.store.InsertRequest(r); err != nil {
@@ -164,7 +215,10 @@ func (m *Manager) SubmitObserved(ctx context.Context, atespace, actor, host, ip,
 // hostname before approving (blocked connections carry an IP, not a name).
 func (m *Manager) SetRequestHost(id int64, host string) error {
 	host = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
-	if host == "" || strings.Contains(host, "/") || strings.Contains(host, " ") {
+	if host == "*" {
+		return fmt.Errorf("wildcards are granted only through the console's full-internet action")
+	}
+	if !validHost(host) {
 		return fmt.Errorf("invalid hostname %q", host)
 	}
 	return m.store.SetHost(id, host)
@@ -197,9 +251,11 @@ func destIP(dest string) string {
 	return dest
 }
 
-// ptrHost reverse-resolves an IP; empty on failure (no PTR records exist).
-func ptrHost(ip string) string {
-	names, err := net.LookupAddr(ip)
+// ptrWithCtx reverse-resolves an IP under the caller's (timeout-bounded)
+// context; empty on failure (no PTR records exist).
+func ptrWithCtx(ctx context.Context, ip string) string {
+	r := &net.Resolver{}
+	names, err := r.LookupAddr(ctx, ip)
 	if err != nil || len(names) == 0 {
 		return ""
 	}

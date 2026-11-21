@@ -125,8 +125,10 @@ func TestPoolTTLSuspendSkipsInflight(t *testing.T) {
 func TestPoolMaxAgeDeletion(t *testing.T) {
 	b := &countingBackend{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	// maxAge 0: any acquired-then-released session is past age.
-	pl := pool.New(b, nil, log, time.Hour /* idle */, 0 /* delete-immediate */, time.Hour)
+	// maxAge 0: the creation-time cap deletes even a never-idle session.
+	// (deleteIdleTTL stays at 1h so only the MAX-AGE branch can fire — the
+	// old parameters never exercised it.)
+	pl := pool.New(b, nil, log, time.Hour /* idle */, time.Hour /* delete-idle */, 0 /* max age */)
 	pl.WarmWindow = 0
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

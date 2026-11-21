@@ -38,43 +38,44 @@ func Hash8(s string) string {
 
 // ActorName builds the DNS-1123-safe actor name for this route. Named chats
 // (Open WebUI's X-Session-Id, a UUID) appear verbatim so logs map 1:1 to the
-// chat; unsaved chats ("adhoc") and unclean session ids fall back to hashes.
+// chat; anything non-canonical (unsaved chats, ids with "_" or "." or other
+// separators) is hashed instead — a_b and a-b must never map to one actor.
 func (k RouteKey) ActorName(prefix string) string {
 	if k.ChatID == AdhocChat {
 		return fmt.Sprintf("%su%s-adhoc", prefix, Hash8(k.UserID))
 	}
-	if chat := dnsSafe(k.ChatID); chat != "" {
+	if chat := canonicalSegment(k.ChatID); chat != "" {
 		return fmt.Sprintf("%su%s-%s", prefix, Hash8(k.UserID), chat)
 	}
 	return fmt.Sprintf("%su%s-c%s", prefix, Hash8(k.UserID), Hash8(k.ChatID))
 }
 
-// dnsSafe sanitizes a session id to a DNS-1123-safe segment. Empty result
-// means "not representable".
-func dnsSafe(id string) string {
+// SfKey is an unambiguous singleflight key: LogString's "/" separator made
+// user "a/b" + chat "c" collide with user "a" + chat "b/c" (and the collision
+// handed one caller the other key's session).
+func (k RouteKey) SfKey() string {
+	return k.UserID + "\x00" + k.ChatID + "\x00sf"
+}
+
+// canonicalSegment returns the id verbatim only when it is already a
+// DNS-1123-safe label segment (lowercase alphanumerics + inner dashes, no
+// leading/trailing dash, short enough to leave room for the prefix + user
+// hash); anything else maps to ""
+// (→ the caller hashes).
+func canonicalSegment(id string) string {
 	id = strings.ToLower(strings.TrimSpace(id))
-	var b strings.Builder
-	lastDash := true // suppress leading dash
+	if id == "" || len(id) > 38 {
+		return ""
+	}
+	if strings.HasPrefix(id, "-") || strings.HasSuffix(id, "-") {
+		return ""
+	}
 	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-			lastDash = false
-		case r == '-', r == '_', r == '.', r == ' ':
-			if !lastDash {
-				b.WriteRune('-')
-				lastDash = true
-			}
-		default:
-			// disallowed byte in the id: fall back to hashing entirely
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
 			return ""
 		}
 	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 38 { // prefix + userhash + this must stay ≤63
-		return ""
-	}
-	return out
+	return id
 }
 
 // ActorRef is the substrate-space reference "<atespace>/<actor>".

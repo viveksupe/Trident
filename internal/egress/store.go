@@ -51,10 +51,15 @@ type Store struct {
 
 // Open creates the schema in path (WAL, same conventions as sessionmap).
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open egress store: %w", err)
 	}
+	defer func() {
+		if db != nil {
+			_ = db.Close() // schema set-up failed: don't leak the handle
+		}
+	}()
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS egress_requests (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,7 +87,9 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("egress store schema: %w", err)
 		}
 	}
-	return &Store{db: db}, nil
+	st := &Store{db: db}
+	db = nil // ownership transferred
+	return st, nil
 }
 
 // Close closes the database.
@@ -196,15 +203,11 @@ func (s *Store) Pending() ([]Request, error) {
 		FROM egress_requests WHERE status='pending' ORDER BY id ASC`)
 }
 
-// History lists decided requests and live grants, newest first (console feed).
+// History lists decided requests, newest first (console feed).
 func (s *Store) History(limit int) ([]Request, error) {
-	return s.list(fmt.Sprintf(
+	rows, err := s.db.Query(
 		`SELECT id,atespace,actor_name,host,reason,status,created,decided
-		 FROM egress_requests WHERE status<>'pending' ORDER BY id DESC LIMIT %d`, limit))
-}
-
-func (s *Store) list(q string) ([]Request, error) {
-	rows, err := s.db.Query(q)
+		 FROM egress_requests WHERE status<>'pending' ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +227,8 @@ func (s *Store) list(q string) ([]Request, error) {
 }
 
 // Decide transitions a pending request (idempotent: unknown/expired ids error).
+// Only denial / timeout paths use it — approvals go through DecideApproved,
+// which keeps the request, grant and TTL in one transaction.
 func (s *Store) Decide(id int64, status string) (Request, error) {
 	res, err := s.db.Exec(
 		`UPDATE egress_requests SET status=?, decided=? WHERE id=? AND status='pending'`,
@@ -234,38 +239,89 @@ func (s *Store) Decide(id int64, status string) (Request, error) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return Request{}, fmt.Errorf("request %d is not pending", id)
 	}
-	r, err := s.getRequest(id)
-	if err != nil {
-		return Request{}, err
-	}
-	// Only approvals create a grant; denies and timeouts do not open egress.
-	if status == StatusApproved {
-		// Fresh grant starts permanent; the Manager narrows it via SetTTL.
-		if _, err := s.db.Exec(
-			`INSERT INTO egress_grants(request_id,atespace,actor_name,host,granted,expires)
-			 SELECT id,atespace,actor_name,host,?,0 FROM egress_requests WHERE id=?`,
-			r.Decided.UnixNano(), r.ID); err != nil {
-			return r, err
-		}
-	}
-	return r, nil
+	return s.getRequest(id)
 }
 
-// SetTTL narrows the freshly created grant: expiry is decided by the caller
-// (the manager knows the requested TTL), not the status string.
-func (s *Store) SetTTL(requestID int64, expires time.Time) error {
-	_, err := s.db.Exec(
-		`UPDATE egress_grants SET expires=?
-		 WHERE id = (SELECT id FROM egress_grants WHERE request_id=? AND revoked=0
-		             ORDER BY id DESC LIMIT 1)`, expires.UnixNano(), requestID)
-	return err
+// DecideApproved atomically marks the request approved, inserts its grant,
+// and stamps the requested expiry. The manager patches the policy BEFORE
+// calling this, so status/grant-row drift is impossible.
+func (s *Store) DecideApproved(id int64, ttl time.Duration) (Request, Grant, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Request{}, Grant{}, err
+	}
+	defer func() { if tx != nil { _ = tx.Rollback() } }()
+
+	now := time.Now().UnixNano()
+	res, err := tx.Exec(
+		`UPDATE egress_requests SET status=?, decided=? WHERE id=? AND status='pending'`,
+		StatusApproved, now, id)
+	if err != nil {
+		return Request{}, Grant{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return Request{}, Grant{}, fmt.Errorf("request %d is not pending", id)
+	}
+	expires := int64(0)
+	if ttl > 0 {
+		expires = time.Now().Add(ttl).UnixNano()
+	}
+	gres, err := tx.Exec(
+		`INSERT INTO egress_grants(request_id,atespace,actor_name,host,granted,expires)
+		 SELECT id,atespace,actor_name,host,?,? FROM egress_requests WHERE id=?`,
+		now, expires, id)
+	if err != nil {
+		return Request{}, Grant{}, fmt.Errorf("grant insert for request %d: %w", id, err)
+	}
+	grantID, err := gres.LastInsertId()
+	if err != nil {
+		return Request{}, Grant{}, err
+	}
+	rows, err := tx.Query(
+		`SELECT id,atespace,actor_name,host,reason,status,created,decided
+		 FROM egress_requests WHERE id=?`, id)
+	if err != nil {
+		return Request{}, Grant{}, err
+	}
+	var r Request
+	var created, decided int64
+	if rows.Next() {
+		if err := rows.Scan(&r.ID, &r.Atespace, &r.ActorName, &r.Host, &r.Reason,
+			&r.Status, &created, &decided); err != nil {
+			rows.Close()
+			return Request{}, Grant{}, err
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Request{}, Grant{}, err
+	}
+	r.Created, r.Decided = time.Unix(0, created), time.Unix(0, decided)
+	var g Grant
+	var granted int64
+	err = tx.QueryRow(
+		`SELECT id,request_id,atespace,actor_name,host,granted,expires,revoked
+		 FROM egress_grants WHERE id=?`, grantID).Scan(
+		&g.ID, &g.RequestID, &g.Atespace, &g.ActorName, &g.Host, &granted, &expires, new(int64))
+	if err != nil {
+		return Request{}, Grant{}, err
+	}
+	g.Granted = time.Unix(0, granted)
+	if expires != 0 {
+		g.Expires = time.Unix(0, expires)
+	}
+	if err := tx.Commit(); err != nil {
+		return Request{}, Grant{}, err
+	}
+	tx = nil
+	return r, g, nil
 }
 
 // getRequest re-reads one request.
 func (s *Store) getRequest(id int64) (Request, error) {
-	rows, err := s.list(fmt.Sprintf(
+	rows, err := s.list(
 		`SELECT id,atespace,actor_name,host,reason,status,created,decided
-		 FROM egress_requests WHERE id=%d`, id))
+		 FROM egress_requests WHERE id=?`, id)
 	if err != nil {
 		return Request{}, err
 	}
@@ -275,16 +331,60 @@ func (s *Store) getRequest(id int64) (Request, error) {
 	return rows[0], nil
 }
 
-// ClearHistory deletes decided requests and closed (revoked/expired) grants.
-// Pending requests and live grants are untouched.
+// GetRequest returns one request by id (any status), or nil — the console
+// and the actor's status poll stop walking paged lists.
+func (s *Store) GetRequest(id int64) (*Request, error) {
+	rows, err := s.list(
+		`SELECT id,atespace,actor_name,host,reason,status,created,decided
+		 FROM egress_requests WHERE id=?`, id)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return &rows[0], nil
+}
+
+// PendingCountForActor reports the actor's open request count (per-actor
+// flood cap).
+func (s *Store) PendingCountForActor(actor string) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM egress_requests WHERE status='pending' AND actor_name=?`,
+		actor).Scan(&n)
+	return n, err
+}
+
+// list runs a query with optional args and scans requests.
+func (s *Store) list(q string, args ...any) ([]Request, error) {
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		var r Request
+		var created, decided int64
+		if err := rows.Scan(&r.ID, &r.Atespace, &r.ActorName, &r.Host, &r.Reason,
+			&r.Status, &created, &decided); err != nil {
+			return nil, err
+		}
+		r.Created, r.Decided = time.Unix(0, created), time.Unix(0, decided)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ClearHistory drops decided requests and closed (revoked) grants. Pending
+// requests and live grants are untouched — grants that expired but have not
+// been swept yet still carry policy rules, so they are never deleted here
+// (the revoke ticker closes them first).
 func (s *Store) ClearHistory() (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM egress_requests WHERE status<>'pending'`)
 	if err != nil {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	_, err = s.db.Exec(`DELETE FROM egress_grants WHERE revoked<>0 OR
-		(expires<>0 AND expires < strftime('%s','now') * 1000000000)`)
+	_, err = s.db.Exec(`DELETE FROM egress_grants WHERE revoked<>0`)
 	return n, err
 }
 
@@ -411,11 +511,18 @@ func (s *Store) GrantForRequest(requestID int64) (Grant, error) {
 	return g, nil
 }
 
-// SetHost updates the allowlist hostname of a request (human correction of
-// IP-only gateway observations).
+// SetHost updates the allowlist hostname of a PENDING request (human
+// correction of IP-only gateway observations). Decided requests are frozen.
 func (s *Store) SetHost(id int64, host string) error {
-	_, err := s.db.Exec(`UPDATE egress_requests SET host=? WHERE id=?`, host, id)
-	return err
+	res, err := s.db.Exec(`UPDATE egress_requests SET host=? WHERE id=? AND status='pending'`,
+		host, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("request %d is not pending", id)
+	}
+	return nil
 }
 
 // PendingFor returns the pending request matching actor+host, plus its id.

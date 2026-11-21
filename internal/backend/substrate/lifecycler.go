@@ -218,7 +218,10 @@ func (l *Lifecycle) EnsureCreated(ctx context.Context, atespace, name string) er
 	if err := createActor(ctx, l.client, atespace, name, l.TemplateAtespace, l.TemplateName); err != nil {
 		return err
 	}
-	if len(l.EgressHosts) > 0 {
+	// An egress policy exists whenever the shim needs one: the base
+	// allowlist, or the callback rule alone (an empty EgressHosts used to
+	// silently disable the whole approval flow).
+	if len(l.EgressHosts) > 0 || l.CallbackHost != "" {
 		if err := createActorEgressPolicy(ctx, l.client, atespace, name, l.EgressHosts, l.CallbackHost); err != nil {
 			return err
 		}

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viveksupe/Trident/third_party/ateapi"
@@ -31,6 +32,21 @@ type Manager struct {
 	// RequestTTL bounds how long approvals of pending requests stay valid:
 	// pending requests older than this are marked timed_out by the ticker.
 	RequestTTL time.Duration
+	// MaxPendingPerActor is the per-actor cap on open requests (a sandbox is
+	// untrusted input: otherwise one actor can flood the console queues).
+	MaxPendingPerActor int
+
+	// policyLocks serializes read-modify-write of one actor's egress policy
+	// across the console, auto-approve, observer and revoke ticker.
+	policyLocks sync.Map // actor name -> *sync.Mutex
+}
+
+// lockPolicy serializes policy RMW for actor.
+func (m *Manager) lockPolicy(actor string) func() {
+	v, _ := m.policyLocks.LoadOrStore(actor, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // actorPrefix is read by the log observer.
@@ -41,7 +57,7 @@ func (m *Manager) checkerFor() ActorChecker { return m.check }
 
 // New constructs the manager.
 func New(store *Store, lc *substrate.Lifecycle, check ActorChecker, log *slog.Logger) *Manager {
-	return &Manager{store: store, lc: lc, check: check, log: log, RequestTTL: 24 * time.Hour}
+	return &Manager{store: store, lc: lc, check: check, log: log, RequestTTL: 24 * time.Hour, MaxPendingPerActor: 50}
 }
 
 // Submit validates and records an actor's request for host egress.
@@ -52,6 +68,13 @@ func (m *Manager) Submit(ctx context.Context, actor, host, reason string) (*Requ
 	}
 	if !validHost(host) {
 		return nil, fmt.Errorf("invalid hostname %q", host)
+	}
+	if actor == "" || len(actor) > 128 {
+		return nil, fmt.Errorf("invalid actor %q", actor)
+	}
+	if n, err := m.store.PendingCountForActor(actor); err == nil && m.MaxPendingPerActor > 0 &&
+		n >= m.MaxPendingPerActor {
+		return nil, fmt.Errorf("actor %q has too many open egress requests", actor)
 	}
 	if existing, err := m.store.PendingFor(actor, host); err == nil && len(existing) > 0 {
 		// One pending request per (actor, host) is enough; a newly enabled
@@ -110,23 +133,36 @@ func (m *Manager) maybeAutoApprove(ctx context.Context, r *Request) error {
 	return nil
 }
 
-// approveRequestLocked performs the grant + policy patch common to the
-// console approve path and auto-approval.
+// approves the request with the rule's TTL.
 func (m *Manager) approveRequestLocked(ctx context.Context, req Request, ttl time.Duration) error {
-	if _, err := m.store.Decide(req.ID, StatusApproved); err != nil {
+	// Policy patch FIRST, then the bookkeeping in one transaction: a failure
+	// above leaves the request pending (retryable), and approval only lands
+	// when a policy rule actually exists behind it. The old order (approve
+	// then patch) left permanently "approved" rows with no rule behind them
+	// when the substrate call failed.
+	if err := m.addRule(ctx, Grant{
+		Atespace: req.Atespace, ActorName: req.ActorName, Host: req.Host,
+	}); err != nil {
 		return err
 	}
-	g, err := m.store.GrantForRequest(req.ID)
+	g, _, err := m.store.DecideApproved(req.ID, ttl)
 	if err != nil {
+		// Roll the rule back out so no access exists without bookkeeping.
+		if rbErr := m.removeRule(ctx, Grant{
+			Atespace: req.Atespace, ActorName: req.ActorName, Host: req.Host,
+		}); rbErr != nil {
+			m.log.Warn("approval bookkeeping failed and policy rollback failed too",
+				"request", req.ID, "actor", req.ActorName, "host", req.Host)
+		}
 		return err
 	}
-	if ttl > 0 {
-		if err := m.store.SetTTL(req.ID, time.Now().Add(ttl)); err != nil {
-			return err
-		}
-		g.Expires = time.Now().Add(ttl)
-	}
-	return m.addRule(ctx, g)
+	_ = g
+	return nil
+}
+
+// GetRequest returns one request by id (any status), or nil.
+func (m *Manager) GetRequest(id int64) (*Request, error) {
+	return m.store.GetRequest(id)
 }
 
 // Approve opens egress for the request's (actor, host): patch the substrate
@@ -138,6 +174,12 @@ func (m *Manager) Approve(ctx context.Context, requestID int64, ttl time.Duratio
 	}
 	if !ok {
 		return fmt.Errorf("request %d not found", requestID)
+	}
+	if req.Host == "" {
+		return fmt.Errorf("request %d has no hostname — correct it before approving", requestID)
+	}
+	if !validHost(req.Host) {
+		return fmt.Errorf("request %d hostname %q is not a valid hostname", requestID, req.Host)
 	}
 	if err := m.approveRequestLocked(ctx, req, ttl); err != nil {
 		return err
@@ -204,6 +246,7 @@ func hasAllPortWildcard(pol *ateapi.EgressPolicy) bool {
 // hostname) for one actor and records the grant so the console shows and can
 // revoke it. Deliberate escalation: logged loudly.
 func (m *Manager) GrantFullInternet(ctx context.Context, atespace, actor string, ttl time.Duration) error {
+	defer m.lockPolicy(actor)()
 	pol, err := m.lc.GetEgressPolicy(ctx, atespace, actor)
 	if err != nil {
 		return err
@@ -279,15 +322,12 @@ func (m *Manager) ClearHistoryRevokeAll(ctx context.Context) (revoked int, clear
 		return 0, 0, err
 	}
 	for _, g := range live {
-		if err := m.removeRule(ctx, g); err != nil {
+		if err := m.revokeGrant(ctx, live, g); err != nil {
 			m.log.Warn("clear-history revoke failed", "actor", g.ActorName, "host", g.Host, "err", err)
 			continue
 		}
-		if err := m.store.MarkRevoked(g.ID); err != nil {
-			return revoked, 0, err
-		}
 		revoked++
-		m.log.Info("egress revoked (clear history)", "actor", g.ActorName, "host", g.Host)
+		m.log.Info("egress grant closed (clear history)", "actor", g.ActorName, "host", g.Host)
 	}
 	n, err := m.store.ClearHistory()
 	return revoked, n, err
@@ -303,16 +343,38 @@ func (m *Manager) Revoke(ctx context.Context, grantID int64) error {
 		if g.ID != grantID {
 			continue
 		}
-		if err := m.removeRule(ctx, g); err != nil {
-			return err
-		}
-		if err := m.store.MarkRevoked(g.ID); err != nil {
-			return err
-		}
-		m.log.Info("egress revoked", "actor", g.ActorName, "host", g.Host)
-		return nil
+		return m.revokeGrant(ctx, live, g)
 	}
 	return fmt.Errorf("grant %d not live", grantID)
+}
+
+// revokeGrant closes one grant. The policy is only patched when no OTHER
+// live grant for the same (actor, host) keeps the rule alive — duplicate
+// grants exist (observed + helper paths) and revoking one must not revoke
+// the access the other bought, nor drop baseline rules the host shares.
+func (m *Manager) revokeGrant(ctx context.Context, live []Grant, g Grant) error {
+	now := time.Now()
+	for _, other := range live {
+		if other.ID == g.ID || other.ActorName != g.ActorName || other.Host != g.Host {
+			continue
+		}
+		if other.Expires.IsZero() || other.Expires.After(now) {
+			// Another live grant still holds this rule: only stamp this one.
+			if err := m.store.MarkRevoked(g.ID); err != nil {
+				return err
+			}
+			m.log.Info("egress grant closed (other grants keep the rule)", "actor", g.ActorName, "host", g.Host)
+			return nil
+		}
+	}
+	if err := m.removeRule(ctx, g); err != nil {
+		return err
+	}
+	if err := m.store.MarkRevoked(g.ID); err != nil {
+		return err
+	}
+	m.log.Info("egress revoked", "actor", g.ActorName, "host", g.Host)
+	return nil
 }
 
 // RunRevokeTicker revokes expired TTL grants every interval. Blocking.
@@ -339,7 +401,7 @@ func (m *Manager) sweep(ctx context.Context) {
 	for _, g := range live {
 		if !g.Expires.IsZero() && now.After(g.Expires) {
 			m.log.Info("revoking expired egress grant", "actor", g.ActorName, "host", g.Host)
-			if err := m.Revoke(ctx, g.ID); err != nil {
+			if err := m.revokeGrant(ctx, live, g); err != nil {
 				m.log.Warn("revoke failed", "grant", g.ID, "err", err)
 			}
 		}
@@ -361,7 +423,9 @@ func (m *Manager) expireStaleRequests() (int, error) {
 	for _, r := range pending {
 		if time.Since(r.Created) > m.RequestTTL {
 			if _, err := m.store.Decide(r.ID, StatusTimedOut); err != nil {
-				return n, err
+				// One bad row must not orphan the rest of the sweep.
+				m.log.Warn("stale-request expiry failed", "request", r.ID, "err", err)
+				continue
 			}
 			n++
 		}
@@ -369,8 +433,21 @@ func (m *Manager) expireStaleRequests() (int, error) {
 	return n, nil
 }
 
-// addRule patches the actor's policy: append a tls-passthrough host if absent.
-func (m *Manager) addRule(ctx context.Context, g Grant) error {
+// addRule patches the actor's policy: append a tls-passthrough host if
+// absent. Serialized per actor and retried once on update failure
+// (re-fetching the fresh policy metadata first) so a concurrent console /
+// observer write can't wedge the grant behind a stale-version rejection.
+func (m *Manager) addRule(ctx context.Context, g Grant) (err error) {
+	defer m.lockPolicy(g.ActorName)()
+	for attempt := 0; attempt < 2; attempt++ {
+		if err = m.addRuleOnce(ctx, g); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func (m *Manager) addRuleOnce(ctx context.Context, g Grant) error {
 	pol, err := m.lc.GetEgressPolicy(ctx, g.Atespace, g.ActorName)
 	if err != nil {
 		return err
@@ -387,17 +464,24 @@ func (m *Manager) addRule(ctx context.Context, g Grant) error {
 	return m.lc.UpdateEgressPolicy(ctx, g.Atespace, g.ActorName, pol)
 }
 
-// removeRule patches the actor's policy: drop the tls-passthrough host.
-func (m *Manager) removeRule(ctx context.Context, g Grant) error {
-	pol, err := m.lc.GetEgressPolicy(ctx, g.Atespace, g.ActorName)
-	if err != nil {
-		return err
+// removeRule patches the actor's policy: drop the host's rules (only the
+// refcount-free paths call it — see revokeGrant).
+func (m *Manager) removeRule(ctx context.Context, g Grant) (err error) {
+	defer m.lockPolicy(g.ActorName)()
+	for attempt := 0; attempt < 2; attempt++ {
+		var pol *ateapi.EgressPolicy
+		if pol, err = m.lc.GetEgressPolicy(ctx, g.Atespace, g.ActorName); err != nil {
+			return err
+		}
+		if pol == nil {
+			return nil
+		}
+		pol.Rules = dropLegacyForHost(pol.Rules, g.Host)
+		if err = m.lc.UpdateEgressPolicy(ctx, g.Atespace, g.ActorName, pol); err == nil {
+			return nil
+		}
 	}
-	if pol == nil {
-		return nil
-	}
-	pol.Rules = dropLegacyForHost(pol.Rules, g.Host)
-	return m.lc.UpdateEgressPolicy(ctx, g.Atespace, g.ActorName, pol)
+	return err
 }
 
 // dropLegacyForHost removes all rules matching host (any-port legacy rules
@@ -496,18 +580,29 @@ func dropHostname(hostnames []string, host string) []string {
 	return out
 }
 
-// validHost accepts RFC-ish DNS hostnames as the policy validators do.
+// validHost accepts RFC-1123 DNS names (LDH labels) as the policy validators
+// do. Wildcards are rejected everywhere else: a "*" grant exists ONLY
+// through GrantFullInternet, which logs loudly — an actor-controlled
+// Submit("*") must not silently bypass it (a standing auto rule used to
+// turn "*" into "every host on 80/443").
 func validHost(h string) bool {
-	if h == "" || strings.Contains(h, "/") || strings.Contains(h, ":") {
+	if h == "" || len(h) > 253 {
 		return false
 	}
-	labels := strings.Split(strings.TrimSuffix(h, "."), ".")
-	for _, l := range labels {
-		if l == "" || strings.Contains(l, " ") {
+	for _, r := range h {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '.':
+		default:
 			return false
 		}
 	}
-	return len(labels) >= 1
+	labels := strings.Split(strings.TrimSuffix(h, "."), ".")
+	for _, l := range labels {
+		if l == "" || strings.HasPrefix(l, "-") || strings.HasSuffix(l, "-") {
+			return false
+		}
+	}
+	return true
 }
 
 // State is the console payload.
@@ -537,27 +632,15 @@ type PagedParams struct {
 	PendingPage, LivePage, HistoryPage, AutosPage, PerPage int
 }
 
-// requestByID scans pending+history for a request.
+// requestByID resolves a request through the store's index (the old
+// pending-page + last-50-history scan 404'd older requests, which looped the
+// helper's wait forever).
 func (m *Manager) requestByID(id int64) (Request, bool, error) {
-	pending, _, err := m.store.PendingPaged(1000, 0)
-	if err != nil {
+	r, err := m.store.GetRequest(id)
+	if err != nil || r == nil {
 		return Request{}, false, err
 	}
-	for _, r := range pending {
-		if r.ID == id {
-			return r, true, nil
-		}
-	}
-	hist, err := m.store.History(500)
-	if err != nil {
-		return Request{}, false, err
-	}
-	for _, r := range hist {
-		if r.ID == id {
-			return r, true, nil
-		}
-	}
-	return Request{}, false, nil
+	return *r, true, nil
 }
 
 // SetAuto toggles a per-actor auto-approve rule.

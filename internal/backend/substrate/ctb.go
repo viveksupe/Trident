@@ -64,28 +64,52 @@ func newTrustBundleClient(clientset kubernetes.Interface) (*trustBundleClient, e
 	return &trustBundleClient{clientset: clientset, v1: gv == certsv1.SchemeGroupVersion}, nil
 }
 
-func (c *trustBundleClient) list(ctx context.Context) ([]trustBundle, error) {
+func (c *trustBundleClient) list(ctx context.Context, selector string) ([]trustBundle, error) {
 	if c.v1 {
-		list, err := c.clientset.CertificatesV1().ClusterTrustBundles().List(ctx, metav1.ListOptions{})
+		list, err := c.clientset.CertificatesV1().ClusterTrustBundles().List(ctx, metav1.ListOptions{LabelSelector: selector})
 		if err != nil {
 			return nil, err
 		}
-		return toBundles(len(list.Items), func(i int) (string, certsv1.ClusterTrustBundleSpec) {
-			return list.Items[i].Name, list.Items[i].Spec
+		if len(list.Items) > 0 || selector == "" {
+			return toBundles(list.Items, func(i int) (string, certsv1.ClusterTrustBundleSpec) {
+				return list.Items[i].Name, list.Items[i].Spec
+			}), nil
+		}
+		// The live-canary selector is substrate's in-cluster convention; an
+		// install without the label still has bundles to trust.
+		fallback, err := c.clientset.CertificatesV1().ClusterTrustBundles().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return toBundles(fallback.Items, func(i int) (string, certsv1.ClusterTrustBundleSpec) {
+			return fallback.Items[i].Name, fallback.Items[i].Spec
 		}), nil
 	}
-	list, err := c.clientset.CertificatesV1beta1().ClusterTrustBundles().List(ctx, metav1.ListOptions{})
+	list, err := c.clientset.CertificatesV1beta1().ClusterTrustBundles().List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return nil, err
 	}
-	return toBundles(len(list.Items), func(i int) (string, certsv1.ClusterTrustBundleSpec) {
-		return list.Items[i].Name, certsv1.ClusterTrustBundleSpec(list.Items[i].Spec)
-	}), nil
+	items := list.Items
+	if len(items) == 0 && selector != "" {
+		fallback, err := c.clientset.CertificatesV1beta1().ClusterTrustBundles().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		items = fallback.Items
+	}
+	out := make([]trustBundle, 0, len(items))
+	for i := range items {
+		spec := certsv1beta1.ClusterTrustBundleSpec(items[i].Spec)
+		out = append(out, trustBundle{
+			name: items[i].Name, signerName: spec.SignerName, trustBundle: spec.TrustBundle,
+		})
+	}
+	return out, nil
 }
 
-func toBundles(n int, at func(int) (string, certsv1.ClusterTrustBundleSpec)) []trustBundle {
-	out := make([]trustBundle, 0, n)
-	for i := 0; i < n; i++ {
+func toBundles(items []certsv1.ClusterTrustBundle, at func(int) (string, certsv1.ClusterTrustBundleSpec)) []trustBundle {
+	out := make([]trustBundle, 0, len(items))
+	for i := range items {
 		name, spec := at(i)
 		out = append(out, trustBundle{name: name, signerName: spec.SignerName, trustBundle: spec.TrustBundle})
 	}

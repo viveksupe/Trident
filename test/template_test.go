@@ -1,7 +1,6 @@
 package test
 
 import (
-	"os"
 	"testing"
 	"time"
 
@@ -15,8 +14,6 @@ func TestRenderedActorTemplateStrictParses(t *testing.T) {
 		Atespace: "ots-webui", TemplateRef: "ots-webui/open-terminal", ActorPort: 8000,
 		Features: config.DefaultFeatures(), EgressHosts: config.DefaultEgressHosts(),
 	}
-	t.Setenv("ANTS", "")
-	os.Unsetenv("ANTHROPIC_API_KEY")
 	rendered := substrate.RenderTemplateForTest(cfg, "ghcr.io/example/ot-actor@sha256:abc")
 	tmpl, err := substrate.ActorTemplateFromManifest([]byte(rendered))
 	if err != nil {

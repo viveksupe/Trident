@@ -114,7 +114,7 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface, server
 	if err != nil {
 		return nil, fmt.Errorf("discover ClusterTrustBundle API: %w", err)
 	}
-	items, err := bundles.list(ctx)
+	items, err := bundles.list(ctx, liveBundleSelector)
 	if err != nil {
 		return nil, fmt.Errorf("list ClusterTrustBundles: %w", err)
 	}
@@ -148,15 +148,7 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface, server
 // whoever runs the client (same semantics as internal/ateclient).
 func bearerTokenDialOption(ctx context.Context, clientset kubernetes.Interface, tokenFile, clientSA, systemNamespace, apiHost string) (grpc.DialOption, error) {
 	if tokenFile != "" {
-		b, err := os.ReadFile(tokenFile)
-		if err != nil {
-			return nil, fmt.Errorf("read token file: %w", err)
-		}
-		token := strings.TrimSpace(string(b))
-		if token == "" {
-			return nil, fmt.Errorf("token file %q is empty", tokenFile)
-		}
-		return grpc.WithPerRPCCredentials(staticBearer(token)), nil
+		return grpc.WithPerRPCCredentials(&staticBearer{path: tokenFile}), nil
 	}
 	// Long-running shims outlive a token minted at startup: the credential
 	// re-mints itself whenever a call needs a token within 5 minutes of
@@ -171,16 +163,45 @@ func bearerTokenDialOption(ctx context.Context, clientset kubernetes.Interface, 
 	}), nil
 }
 
-// staticBearer is an immutable bearer-token gRPC credential (token files).
-type staticBearer string
-
-func (c staticBearer) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
-	if c == "" {
-		return nil, fmt.Errorf("bearer token is empty")
-	}
-	return map[string]string{"authorization": "Bearer " + string(c)}, nil
+// staticBearer is a bearer-token gRPC credential backed by a token file; the
+// file is re-read when it changes (a rotated projected token used to leave
+// the shim pinned to the bytes minted at startup).
+type staticBearer struct {
+	mu   sync.Mutex
+	path string
+	tok  string
+	mod  time.Time
 }
-func (c staticBearer) RequireTransportSecurity() bool { return true }
+
+func (c *staticBearer) token() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, err := os.Stat(c.path)
+	if err != nil {
+		return "", fmt.Errorf("read token file: %w", err)
+	}
+	if c.tok == "" || !st.ModTime().Equal(c.mod) {
+		b, err := os.ReadFile(c.path)
+		if err != nil {
+			return "", fmt.Errorf("read token file: %w", err)
+		}
+		tok := strings.TrimSpace(string(b))
+		if tok == "" {
+			return "", fmt.Errorf("token file %q is empty", c.path)
+		}
+		c.tok, c.mod = tok, st.ModTime()
+	}
+	return c.tok, nil
+}
+
+func (c *staticBearer) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
+	tok, err := c.token()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"authorization": "Bearer " + tok}, nil
+}
+func (c *staticBearer) RequireTransportSecurity() bool { return true }
 
 // saTokenCreds is a refreshing bearer credential: keeps a SA-minted token
 // alive for the life of the process.

@@ -2,6 +2,7 @@ package test
 
 import (
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/viveksupe/Trident/internal/model"
@@ -41,5 +42,28 @@ func TestActorNameStable(t *testing.T) {
 	}
 	if a == c {
 		t.Fatal("different chats must map to different actors")
+	}
+}
+
+// Collision regression: dnsSafe used to fold "_" and "." into "-", mapping
+// user a + chat "b_c" onto user a + chat "b-c" (two chats, one sandbox).
+func TestActorNameNoSeparatorCollisions(t *testing.T) {
+	a := model.NewRouteKey("u1", "b-c").ActorName("ot-")
+	b := model.NewRouteKey("u1", "b_c").ActorName("ot-")
+	c := model.NewRouteKey("u1", "b.c").ActorName("ot-")
+	if a == b || a == c || b == c {
+		t.Fatalf("separator variants must hash to distinct actors: %q %q %q", a, b, c)
+	}
+	if !strings.HasPrefix(a, "ot-u") {
+		t.Fatalf("canonical id should appear verbatim: %q", a)
+	}
+}
+
+// A canonical UUID chat id stays verbatim (log mapping to Open WebUI chats).
+func TestActorNameUUIDVerbatim(t *testing.T) {
+	id := "e8622b55-2d4f-4986-99d3-48295ca33797"
+	name := model.NewRouteKey("u1", id).ActorName("ot-")
+	if !strings.Contains(name, id) {
+		t.Fatalf("UUID chat id must appear in the actor name: %q", name)
 	}
 }

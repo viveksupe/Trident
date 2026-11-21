@@ -57,8 +57,6 @@ func kubeClientset(cfg *rest.Config) (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-func osLookupEnv(key string) (string, bool) { return os.LookupEnv(key) }
-
 // kubeConfigForEnv resolves the kubeconfig from the KUBECONFIG env (used by
 // diagnostic helpers and the log observer).
 func kubeConfigForEnv() (*rest.Config, error) { return kubeConfig(os.Getenv("KUBECONFIG"), "") }
