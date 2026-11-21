@@ -7,6 +7,7 @@ import (
 
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/viveksupe/Trident/internal/pool"
@@ -86,6 +87,13 @@ func (s *Server) actorsState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"actors": out})
 }
 
+// managedActor reports whether name matches this shim's prefix (console
+// delete/suspend must not touch actors in the atespace that other tooling
+// owns).
+func (s *Server) managedActor(name string) bool {
+	return strings.HasPrefix(name, s.cfg.ActorPrefix)
+}
+
 // actorsDelete destroys (or suspends) one actor by name.
 func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
 	if !s.consoleAuthed(w, r) {
@@ -96,11 +104,16 @@ func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
 		Action string `json:"action"` // delete | suspend | internet
 		TTL    string `json:"ttl"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
 		writeJSON(w, http.StatusBadRequest, detail{"name is required"})
 		return
 	}
 	body.Action = orDefault(body.Action, "delete")
+	if !s.managedActor(body.Name) {
+		writeJSON(w, http.StatusBadRequest, detail{"actor is not managed by this shim (" + s.cfg.ActorPrefix + "* names only)"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 	h := &backend.Handle{Name: body.Name}
@@ -122,7 +135,7 @@ func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, detail{"bad ttl: " + terr.Error()})
 			return
 		}
-		if terr = s.egress.GrantFullInternet(ctx, "ots-webui", body.Name, ttl); terr != nil {
+		if terr = s.egress.GrantFullInternet(ctx, s.cfg.Atespace, body.Name, ttl); terr != nil {
 			writeJSON(w, http.StatusInternalServerError, detail{terr.Error()})
 			return
 		}

@@ -54,11 +54,9 @@ func TestEgressFlowStoreAndManager(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("want 1 pending, got %d", len(pending))
 	}
-	// Decide moves it to grants (permanent), SetTTL narrows it.
-	if _, err := st.Decide(r1.ID, egress.StatusApproved); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.SetTTL(r1.ID, time.Now().Add(-1*time.Minute)); err != nil {
+	// DecideApproved atomically marks approval + grant + expiry; a negative
+	// TTL produces an already-expired grant the same way a lapsed one does.
+	if _, _, err := st.DecideApproved(r1.ID, -time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	live, err := st.Live()
@@ -66,7 +64,7 @@ func TestEgressFlowStoreAndManager(t *testing.T) {
 		t.Fatalf("live grants: %v %v", live, err)
 	}
 	if live[0].Expires.IsZero() {
-		t.Fatal("SetTTL did not persist the expiry")
+		t.Fatal("DecideApproved did not persist the expiry")
 	}
 	// Double-decide is refused.
 	if _, err := st.Decide(r1.ID, egress.StatusDenied); err == nil {
@@ -97,6 +95,7 @@ func newConfigFor(t *testing.T) (*config.Config, error) {
 
 func TestConsoleTokenDistinct(t *testing.T) {
 	t.Setenv("TRI_API_KEY", "agent-facing-key")
+	t.Setenv("TRI_ACTOR_API_KEY", "actor-side-key")
 	t.Setenv("TRI_BACKEND", "substrate")
 	t.Setenv("TRI_EGRESS_CALLBACK", "trident-callback.ot-workerpool.svc:8080")
 	// Same console token as API key must be refused at startup.
@@ -107,5 +106,21 @@ func TestConsoleTokenDistinct(t *testing.T) {
 	t.Setenv("TRI_CONSOLE_TOKEN", "human-only-secret")
 	if _, err := newConfigFor(t); err != nil {
 		t.Fatalf("distinct console token must validate: %v", err)
+	}
+}
+
+// The actor key must differ from the front key when the egress flow is on:
+// agents hold the front key and reach the callback listener.
+func TestActorKeyDistinct(t *testing.T) {
+	t.Setenv("TRI_API_KEY", "agent-facing-key")
+	t.Setenv("TRI_BACKEND", "substrate")
+	t.Setenv("TRI_EGRESS_CALLBACK", "trident-callback.ot-workerpool.svc:8443")
+	t.Setenv("TRI_CONSOLE_TOKEN", "human-only-secret")
+	if _, err := newConfigFor(t); err == nil {
+		t.Fatal("actor key equal to the front key must fail validation")
+	}
+	t.Setenv("TRI_ACTOR_API_KEY", "actor-side-key")
+	if _, err := newConfigFor(t); err != nil {
+		t.Fatalf("distinct actor key must validate: %v", err)
 	}
 }

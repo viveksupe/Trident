@@ -212,5 +212,3 @@ func TestFacadeBadKeyVariants(t *testing.T) {
 		t.Fatalf("wrong key must 401, got %d", resp.StatusCode)
 	}
 }
-
-var _ = context.Background

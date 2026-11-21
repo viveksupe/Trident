@@ -18,6 +18,8 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/viveksupe/Trident/internal/backend"
 	"github.com/viveksupe/Trident/internal/config"
@@ -34,6 +36,13 @@ type Server struct {
 	egress  *egress.Manager // nil unless the egress approval flow is enabled
 	backend backend.Backend // for the console's actor maintenance panel
 	specs   *specCache      // cached terminal /openapi.json per template
+
+	// transports caches one *http.Transport per actor name and dialers the
+	// LATEST dialer the pool handed out for that actor (a per-request
+	// Transport leaked idle tunnel connections + close goroutines for up to
+	// five minutes each).
+	transports sync.Map // actor name -> *http.Transport
+	dialers    sync.Map // actor name -> backend.Dialer
 }
 
 // New builds the facade server.
@@ -47,7 +56,10 @@ func (s *Server) SetEgress(m *egress.Manager) { s.egress = m }
 // SetBackend attaches the actor backend for console maintenance.
 func (s *Server) SetBackend(b backend.Backend) { s.backend = b }
 
-// Handler returns the root http.Handler.
+// Handler returns the root http.Handler: the human/LAN surface (Open WebUI
+// protocol + console). The actor-facing TLS callback listener uses Handler()
+// never — see CallbackHandler: actors can reach the callback listener by
+// design, so it must expose only the egress callback endpoints.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -78,6 +90,20 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/", s.route)
 	s.RegisterEgress(mux)
+	return mux
+}
+
+// CallbackHandler serves ONLY the actor-facing egress callback endpoints.
+// Actors reach this listener through the tls-passthrough callback rule, so
+// everything else (console pages, console APIs, the `/` proxy and its
+// X-User-Id/X-Session-Id identity routing) must never be reachable here — an
+// agent that landed on those endpoints could self-approve egress or reach
+// other users' actors.
+func (s *Server) CallbackHandler() http.Handler {
+	mux := http.NewServeMux()
+	if s.egress != nil { // only when the egress flow is on does the listener run
+		s.RegisterEgressActor(mux)
+	}
 	return mux
 }
 
@@ -115,16 +141,31 @@ func (s *Server) routeNoAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	defer inflight.Done()
 
+	// Distinct actor key: translate the credentials the actor receives
+	// (front-side API key in → actor key out) on both channels actors
+	// authenticate over — HTTP Authorization headers, and the first frame of
+	// terminal/agent WebSocket upgrades.
+	if s.cfg.KeyRewriteNeeded() {
+		if isWebSocketUpgrade(r) {
+			if s.spliceWS(w, r, ready) {
+				return // splice owns the connection for its lifetime
+			}
+			// Fall through to the plain proxy (it will fail the upgrade with
+			// the translated header only; auth frames would not rewrite).
+		}
+	}
+
 	s.log.Debug("proxied request", "key", key.LogString(), "method", r.Method,
 		"path", r.URL.Path, "actor", ready.Handle.Name)
 	s.proxyFor(ready).ServeHTTP(w, r)
 }
 
-// bearerToken extracts the token from an `Authorization: Bearer <token>` header.
+// bearerToken extracts the token from an `Authorization: Bearer <token>`
+// header (scheme case-insensitive per RFC 7235).
 func bearerToken(h string) string {
-	const prefix = "Bearer "
-	if len(h) > len(prefix) && h[:len(prefix)] == prefix {
-		return h[len(prefix):]
+	scheme, rest, ok := strings.Cut(h, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
 	}
-	return ""
+	return strings.TrimSpace(rest)
 }

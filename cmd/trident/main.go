@@ -83,10 +83,10 @@ func serveCmd(log *slog.Logger) error {
 	}
 	log.Info("trident starting", "backend", cfg.Backend, "listen", cfg.ListenAddr)
 	if cfg.KeyRewriteNeeded() {
-		// WS first-frame token rewrite is not implemented in v1: agent and
-		// terminal WebSockets authenticate inside their first JSON frame, so a
-		// shim key that differs from the actor key would break them.
-		log.Warn("TRI_ACTOR_API_KEY differs from TRI_API_KEY; WebSocket auth frames would not be rewritten. Use the same key on both sides.")
+		// The actor speaks the actor key (baked into the ActorTemplate); the
+		// facade translates Authorization headers and the first frame of
+		// terminal/agent WebSocket upgrades ("type":"auth") front-key-in.
+		log.Info("TRI_ACTOR_API_KEY differs from TRI_API_KEY: credentials are translated on proxy (Authorization header + WS auth frame rewrite)")
 	}
 
 	store, err := sessionmap.Open(cfg.StateDB)
@@ -171,7 +171,6 @@ func serveCmd(log *slog.Logger) error {
 			_ = egressManager.PurgeActor(context.Background(), actorName)
 		}
 	}
-	_ = sweeper
 	if cfg.Backend == config.BackendDocker {
 		pl.AllowSuspend = false // docker stop loses container state; actors stay up
 	}
@@ -224,7 +223,9 @@ func serveCmd(log *slog.Logger) error {
 
 	// TLS callback listener: actors reach this over tls-passthrough with a
 	// self-signed cert (the actor side uses curl -k). Enabled whenever the
-	// egress callback flow is on.
+	// egress callback flow is on. It serves ONLY the actor-facing egress
+	// endpoints — never the console or the front-side proxy (the shared key
+	// an actor holds would otherwise let it cross tenants or self-approve).
 	if egressManager != nil {
 		tlsAddr := envDefault("TRI_TLS_LISTEN_ADDR", ":8443")
 		go func() {
@@ -235,14 +236,19 @@ func serveCmd(log *slog.Logger) error {
 			}
 			s := &http.Server{
 				Addr:              tlsAddr,
-				Handler:           fs.Handler(),
+				Handler:           fs.CallbackHandler(),
 				ReadHeaderTimeout: 10 * time.Second,
 				TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}},
 			}
-			log.Info("tls callback listener", "addr", tlsAddr, "host", substrate.CallbackHostname(cfg.EgressCallback))
-			if err := s.ListenAndServeTLS("", ""); err != nil {
+			log.Info("tls callback listener (egress callback endpoints only)", "addr", tlsAddr, "host", substrate.CallbackHostname(cfg.EgressCallback))
+			go func() {
+				<-ctx.Done()
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = s.Shutdown(shutdownCtx)
+			}()
+			if err := s.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Error("tls callback listener failed", "err", err)
-				return
 			}
 		}()
 	}

@@ -25,15 +25,12 @@ var actorsConsoleHTML string
 // reach the shim only over the pre-approved cleartext callback rule).
 // writeConsolePage is a method on Server (see below).
 
-// writeConsolePage serves a console page with the default console token
-// injected (prefilled when the visitor has none — convenience on private
-// deployments; disable with TRI_CONSOLE_SHOW_DEFAULT=false).
+// writeConsolePage serves a console page. The console token is NEVER embedded
+// in the page (the console API requires it as Bearer/X-Console-Token): the
+// human saves it in the token widget once per browser.
 func (s *Server) writeConsolePage(w http.ResponseWriter, html string) {
-	token := ""
-	if !s.cfg.ConsoleTokenHintOff() {
-		token = s.cfg.ConsoleToken
-	}
-	page := strings.Replace(html, "/*DEFAULT_TOKEN_INJECT*/\"\"", fmt.Sprintf("%q", token), 1)
+	// Defense in depth: strip any accidental default-token marker.
+	page := strings.Replace(html, "/*DEFAULT_TOKEN_INJECT*/\"\"", `""`, 1)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(page))
 }
@@ -48,13 +45,18 @@ case "$host" in ""|-h|--help) echo "usage: tri-egress-request <hostname> [reason
 # an TRI_EGRESS_CALLBACK env var in the actor overrides it.
 svc="${TRI_EGRESS_CALLBACK:-%%CB%%}"
 actor="$(hostname 2>/dev/null || echo unknown)"
-body=$(printf '{"actor":"%s","host":"%s","reason":"%s"}' "$actor" "$host" "$reason")
+# jq builds the body so every hostile character stays escaped.
+if ! body=$(jq -nc --arg actor "$actor" --arg host "$host" --arg reason "$reason" \
+      '{actor:$actor,host:$host,reason:$reason}' 2>/dev/null); then
+  echo "jq is required by this helper but not available" >&2; exit 1
+fi
 resp=$(curl -k -sS -X POST "https://$svc/_tri/egress/request" -H "Content-Type: application/json" --data "$body") || exit 1
 id=$(printf '%s' "$resp" | jq -r .id 2>/dev/null) || exit 1
 [ "$id" != "null" ] && [ -n "$id" ] || { echo "$resp" >&2; exit 1; }
 echo "egress request #$id for '$host' submitted — waiting for approval (Ctrl-C cancels this wait only)" >&2
 while true; do
-  status=$(curl -k -sS "https://$svc/_tri/egress/request/$id" | jq -r .status) || exit 1
+  status=$(curl -k -sS "https://$svc/_tri/egress/request/$id?actor=$(printf '%s' "$actor" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g')" \
+    | jq -r .status) || exit 1
   case "$status" in
     approved)  echo "approved — retry your connection now"; exit 0 ;;
     denied)    echo "denied by the human operator" >&2; exit 1 ;;
@@ -70,9 +72,16 @@ func (s *Server) RegisterEgress(mux *http.ServeMux) {
 	if s.egress == nil || s.cfg.EgressCallback == "" {
 		return
 	}
-	// Actor-side callbacks: no bearer auth (reachable only via the callback
-	// rule inside the actor's egress policy; actor claims are validated by
-	// the manager against the substrate control plane).
+	s.RegisterEgressActor(mux)
+	s.RegisterEgressConsole(mux)
+}
+
+// RegisterEgressActor registers ONLY the actor-facing callback endpoints
+// (helper script, request submission, status polling) on mux. The TLS
+// callback listener is built from this register alone: actors can reach this
+// listener by design (it sits behind the pre-approved callback rule), so the
+// human console and the front-side proxy must never be served here.
+func (s *Server) RegisterEgressActor(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_tri/egress/helper.sh", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		rendered := strings.ReplaceAll(helperScript, "%%CB%%", s.cfg.EgressCallback)
@@ -83,8 +92,11 @@ func (s *Server) RegisterEgress(mux *http.ServeMux) {
 	// payload shape; reason distinguishes the source.
 	mux.HandleFunc("POST /_tri/egress/dns-hit", s.egressRequest)
 	mux.HandleFunc("GET /_tri/egress/request/{id}", s.egressRequestStatus)
+}
 
-	// Human console: Bearer-token (LAN-reachable by design).
+// RegisterEgressConsole registers the human console routes (Bearer console
+// token; LAN-reachable by design).
+func (s *Server) RegisterEgressConsole(mux *http.ServeMux) {
 	// Compat: pre-rename console bookmarks keep working.
 	for _, legacy := range []struct{ from, to string }{
 		{"/_tri/console/egress", "/_trident/console/egress"},
@@ -157,6 +169,7 @@ func (s *Server) egressAutoSet(w http.ResponseWriter, r *http.Request) {
 		Actor string `json:"actor"`
 		TTL   string `json:"ttl"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Actor == "" {
 		writeJSON(w, http.StatusBadRequest, detail{"actor is required"})
 		return
@@ -241,6 +254,7 @@ func (s *Server) decideHandler(approved bool) http.HandlerFunc {
 				Host string `json:"hostname"`
 			}
 			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 				_ = json.NewDecoder(r.Body).Decode(&body) // empty body = permanent
 			}
 			ttl, perr := parseTTL(body.TTL, true)
@@ -266,6 +280,9 @@ func (s *Server) decideHandler(approved bool) http.HandlerFunc {
 }
 
 func (s *Server) egressRevoke(w http.ResponseWriter, r *http.Request) {
+	if !s.consoleAuthed(w, r) {
+		return
+	}
 	id, err := pathID(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, detail{err.Error()})
@@ -313,6 +330,10 @@ func (s *Server) egressState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, state)
 }
 
+// maxBodyBytes caps every actor-facing request body (a sandboxed agent is
+// untrusted input: unbounded reads are a memory DoS at best).
+const maxBodyBytes = 32 << 10
+
 // egressRequest is the actor-side entrypoint.
 func (s *Server) egressRequest(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -320,8 +341,14 @@ func (s *Server) egressRequest(w http.ResponseWriter, r *http.Request) {
 		Host   string `json:"host"`
 		Reason string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, detail{"bad json"})
+		return
+	}
+	if len(body.Actor) > 128 || len(body.Host) > 253 || len(body.Reason) > 512 {
+		writeJSON(w, http.StatusBadRequest, detail{"field too long"})
 		return
 	}
 	req, err := s.egress.Submit(r.Context(), body.Actor, body.Host, body.Reason)
@@ -332,30 +359,25 @@ func (s *Server) egressRequest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, req)
 }
 
+// egressRequestStatus answers the helper's poll. The requesting actor may
+// only see its own requests: when the (optional) ?actor= claim disagrees with
+// the stored request, the id reads as unknown.
 func (s *Server) egressRequestStatus(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, detail{err.Error()})
 		return
 	}
-	state, err := s.egress.Snapshot()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, detail{err.Error()})
+	req, err := s.egress.GetRequest(id)
+	if err != nil || req == nil {
+		writeJSON(w, http.StatusNotFound, detail{"unknown request"})
 		return
 	}
-	for _, pend := range state.Pending {
-		if pend.ID == id {
-			writeJSON(w, http.StatusOK, pend)
-			return
-		}
+	if claim := r.URL.Query().Get("actor"); claim != "" && claim != req.ActorName {
+		writeJSON(w, http.StatusNotFound, detail{"unknown request"})
+		return
 	}
-	for _, h := range state.History {
-		if h.ID == id {
-			writeJSON(w, http.StatusOK, h)
-			return
-		}
-	}
-	writeJSON(w, http.StatusNotFound, detail{"unknown request"})
+	writeJSON(w, http.StatusOK, req)
 }
 
 func pathID(r *http.Request) (int64, error) {

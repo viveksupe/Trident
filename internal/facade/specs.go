@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/viveksupe/Trident/internal/model"
 )
 
 type specCache struct {
@@ -18,69 +20,139 @@ type specCache struct {
 
 func newSpecCache(dir string) *specCache { return &specCache{dir: dir} }
 
-// path returns the cache file for an ActorTemplate ref ("ns/name").
-func (c *specCache) file(templateRef string) string {
-	name := strings.ReplaceAll(templateRef, "/", "-") + "-openapi.json"
-	if strings.Contains(name, "..") || !strings.HasPrefix(name, "open-terminal-") {
-		// Namespace always prefixes the name; the prefix check keeps the
-		// namespace from being a path traversal while allowing real names.
-		if strings.Contains(templateRef, "..") {
-			return ""
-		}
+// specFetchKey is the FIXED internal identity for cache-miss fetches: a
+// keyless client's X-User-Id / X-Session-Id headers must never choose which
+// actor gets created or woken by a spec poll (any caller could otherwise
+// create sandboxes for arbitrary identities).
+var specFetchKey = model.NewRouteKey("_trident-spec-fetch", "spec-cache")
+
+// file returns the cache file for one path of one ActorTemplate ref
+// ("ns/name"). Each path caches separately: an HTML /docs response must never
+// overwrite the JSON spec (the shared file used to serve /docs as JSON and
+// let HTML clobber the spec).
+func (c *specCache) file(templateRef, path string) string {
+	if strings.Contains(templateRef, "..") {
+		return ""
+	}
+	name := strings.ReplaceAll(templateRef, "/", "-")
+	switch path {
+	case "/openapi.json":
+		name += "-openapi.json"
+	case "/docs", "/redoc":
+		name += "-docs.html"
+	default:
+		return ""
 	}
 	return filepath.Join(c.dir, name)
 }
 
-func (c *specCache) load(templateRef string) ([]byte, bool) {
-	f := c.file(templateRef)
+func (c *specCache) load(templateRef, path string) ([]byte, bool) {
+	f := c.file(templateRef, path)
 	if f == "" {
 		return nil, false
 	}
 	b, err := os.ReadFile(f)
-	if err != nil || len(b) == 0 || !bytes.HasPrefix(bytes.TrimSpace(b), []byte("{")) {
+	if err != nil || len(b) == 0 {
 		return nil, false
+	}
+	switch path {
+	case "/openapi.json":
+		// A spec must be a JSON object; anything else (an error page, HTML)
+		// is not cacheable content.
+		if !bytes.HasPrefix(bytes.TrimSpace(b), []byte("{")) {
+			return nil, false
+		}
+	case "/docs", "/redoc":
+		if !bytes.Contains(b, []byte("<")) {
+			return nil, false
+		}
 	}
 	return b, true
 }
 
-func (c *specCache) save(templateRef string, body []byte) {
-	f := c.file(templateRef)
-	if f == "" || len(body) == 0 {
+func (c *specCache) save(templateRef, path string, body []byte) {
+	f := c.file(templateRef, path)
+	if f == "" || len(body) == 0 || len(body) > 4<<20 {
 		return
 	}
-	tmp := f + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+	// Validate BEFORE persisting: only 200s with the right content shape are
+	// cached (checked by the caller for the status; shape here).
+	switch path {
+	case "/openapi.json":
+		if !bytes.HasPrefix(bytes.TrimSpace(body), []byte("{")) {
+			return
+		}
+	case "/docs", "/redoc":
+		if !bytes.Contains(body, []byte("<")) {
+			return
+		}
+	}
+	// os.CreateTemp: concurrent misses on the shared "<file>.tmp" name used
+	// to race and lose each other's writes.
+	tmp, err := os.CreateTemp(c.dir, ".spec-*")
+	if err != nil {
 		return
 	}
-	_ = os.Rename(tmp, f)
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return
+	}
+	if err := os.Rename(tmp.Name(), f); err != nil {
+		_ = os.Remove(tmp.Name())
+	}
 }
 
 // serveSpec answers keyless spec/doc paths (/openapi.json, /docs, /redoc)
 // from the cache; on a miss it proxies to the actor as usual and records the
-// body for next time. Returns true when the request was handled here — the
-// goal is that no keyless poll ever spins up the adhoc actor.
-func (s *Server) serveSpec(w http.ResponseWriter, r *http.Request) bool {
+// body for next time — under the fixed internal identity, never the caller's
+// headers. The goal is that no keyless poll spins up the adhoc actor.
+func (s *Server) serveSpec(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		return false
+		s.routeNoAuth(w, r)
+		return
 	}
 	switch r.URL.Path {
 	case "/openapi.json", "/docs", "/redoc":
 	default:
-		return false
+		s.routeNoAuth(w, r)
+		return
 	}
-	if body, ok := s.specs.load(s.cfg.TemplateRef); ok {
-		w.Header().Set("Content-Type", "application/json")
+	if body, ok := s.specs.load(s.cfg.TemplateRef, r.URL.Path); ok {
+		ct := "application/json"
+		if r.URL.Path != "/openapi.json" {
+			ct = "text/html; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
-		return true
+		return
 	}
 	buf := &bytes.Buffer{}
 	sw := &specRecorder{ResponseWriter: w, buf: buf}
-	s.routeNoAuth(sw, r)
+	s.routeAs(r, sw, specFetchKey)
 	if sw.code == http.StatusOK {
-		s.specs.save(s.cfg.TemplateRef, buf.Bytes())
+		s.specs.save(s.cfg.TemplateRef, r.URL.Path, buf.Bytes())
 	}
-	return true
+}
+
+// routeAs proxies to the actor for a FIXED route key (spec fetches: the
+// caller's X-User-Id / X-Session-Id must not pick the identity).
+func (s *Server) routeAs(r *http.Request, w http.ResponseWriter, key model.RouteKey) {
+	ready, inflight, err := s.pl.Acquire(r.Context(), key)
+	if err != nil {
+		s.log.Warn("acquire failed", "key", key.LogString(), "path", r.URL.Path, "err", err)
+		writeJSON(w, http.StatusBadGateway, detail{"actor not ready: " + err.Error()})
+		return
+	}
+	defer inflight.Done()
+	s.log.Debug("proxied request", "key", key.LogString(), "method", r.Method,
+		"path", r.URL.Path, "actor", ready.Handle.Name)
+	s.proxyFor(ready).ServeHTTP(w, r)
 }
 
 // specRecorder tees the proxied response body so a 200 can be cached.

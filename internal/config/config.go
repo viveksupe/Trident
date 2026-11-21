@@ -2,10 +2,13 @@
 package config
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,6 +39,8 @@ type Config struct {
 	// submit egress-allowlist requests and fetch the helper script. Empty
 	// disables the request flow.
 	EgressCallback string // TRI_EGRESS_CALLBACK
+	CallbackHost   string // parsed once in Load
+	CallbackPort   string
 
 	Backend           string // TRI_BACKEND: substrate | docker
 	StateDB           string // TRI_STATE_DB
@@ -81,7 +86,10 @@ func DefaultEgressHosts() []string {
 	}
 }
 
-// Load reads configuration from the environment. Callers may mutate fields afterwards.
+// Load reads configuration from the environment. Order: struct defaults,
+// then legacy OTS_* aliases (only for names the TRI_* chain leaves below
+// them — the chain keeps the aliased value as its fallback), then TRI_* env.
+// ActorAPIKey is derived last, after every alias has had its say.
 func Load() (*Config, error) {
 	c := &Config{
 		ListenAddr:        "127.0.0.1:8080",
@@ -103,6 +111,11 @@ func Load() (*Config, error) {
 		Features:          DefaultFeatures(),
 		EgressHosts:       DefaultEgressHosts(),
 	}
+	// Legacy aliases seed the values first (only reaching fields the TRI_*
+	// reads below don't override); OTS_EGRESS_HOSTS / OTS_FEATURES_JSON
+	// REPLACE the defaults rather than merging into them.
+	applyLegacyAliases(c)
+
 	c.ListenAddr = envOr("TRI_LISTEN_ADDR", c.ListenAddr)
 	c.Backend = envOr("TRI_BACKEND", c.Backend)
 	c.StateDB = envOr("TRI_STATE_DB", c.StateDB)
@@ -117,9 +130,15 @@ func Load() (*Config, error) {
 	c.SuspendDurability = envOr("TRI_SUSPEND_DURABILITY", c.SuspendDurability)
 
 	c.APIKey = os.Getenv("TRI_API_KEY")
-	c.ActorAPIKey = envOr("TRI_ACTOR_API_KEY", c.APIKey)
 	c.ConsoleToken = os.Getenv("TRI_CONSOLE_TOKEN")
 	c.EgressCallback = os.Getenv("TRI_EGRESS_CALLBACK")
+	// ActorAPIKey derives LAST: aliases then env, falling back to the front
+	// key (a distinct key is enforced by Validate when the egress flow
+	// demands it).
+	c.ActorAPIKey = envOr("TRI_ACTOR_API_KEY", c.APIKey)
+	if c.EgressCallback != "" {
+		c.CallbackHost, c.CallbackPort = splitCallback(c.EgressCallback)
+	}
 
 	var err error
 	if c.ActorPort, err = envInt("TRI_ACTOR_PORT", c.ActorPort); err != nil {
@@ -134,23 +153,41 @@ func Load() (*Config, error) {
 	if c.MaxAge, err = envDur("TRI_MAX_AGE", c.MaxAge); err != nil {
 		return nil, err
 	}
+	// TRI_EGRESS_HOSTS REPLACES the default allowlist (an operator may need
+	// to drop default hosts like sentry.io or npm).
 	if v := os.Getenv("TRI_EGRESS_HOSTS"); v != "" {
-		for _, h := range strings.Split(v, ",") {
-			if h = strings.TrimSpace(h); h != "" {
-				c.EgressHosts = append(c.EgressHosts, h)
-			}
-		}
+		c.EgressHosts = hostsFrom(v)
 	}
 	if v := os.Getenv("TRI_FEATURES_JSON"); v != "" {
-		if err := json.Unmarshal([]byte(v), &c.Features); err != nil {
+		feats := DefaultFeatures()
+		if err := json.Unmarshal([]byte(v), &feats); err != nil {
 			return nil, fmt.Errorf("TRI_FEATURES_JSON: %w", err)
 		}
+		c.Features = feats
 	}
-	applyLegacyAliases(c)
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// hostsFrom splits a comma-separated host list.
+func hostsFrom(v string) []string {
+	var out []string
+	for _, h := range strings.Split(v, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// splitCallback splits "host:port" (a bare host becomes port 8443).
+func splitCallback(cb string) (host, port string) {
+	if i := strings.LastIndex(cb, ":"); i >= 0 {
+		return cb[:i], strings.TrimPrefix(cb[i+1:], ":")
+	}
+	return cb, "8443"
 }
 
 // legacyEnvAliases maps pre-rename OTS_* variables onto their TRI_* fields
@@ -176,7 +213,9 @@ var legacyEnvAliases = map[string]string{
 	"Features":          "OTS_FEATURES_JSON",
 }
 
-// applyLegacyAliases fills unset TRI_* values from their OTS_* names.
+// applyLegacyAliases seeds unset TRI_* values from their pre-rename OTS_*
+// names. It runs before the TRI_* env chain reads, which override aliased
+// values — a stale OTS_API_KEY can no longer shadow TRI_API_KEY.
 func applyLegacyAliases(c *Config) {
 	for field, env := range legacyEnvAliases {
 		v, ok := os.LookupEnv(env)
@@ -200,17 +239,11 @@ func applyLegacyAliases(c *Config) {
 				}
 			}
 		case "EgressHosts":
-			for _, h := range strings.Split(v, ",") {
-				if h = strings.TrimSpace(h); h != "" {
-					c.EgressHosts = append(c.EgressHosts, h)
-				}
-			}
+			c.EgressHosts = hostsFrom(v)
 		case "Features":
 			var m map[string]bool
 			if json.Unmarshal([]byte(v), &m) == nil {
-				for k, b := range m {
-					c.Features[k] = b
-				}
+				c.Features = m
 			}
 		}
 	}
@@ -250,6 +283,9 @@ func (c *Config) Validate() error {
 	if c.APIKey == "" {
 		return errors.New("TRI_API_KEY is required (the front-side API key Open WebUI uses)")
 	}
+	if c.ActorAPIKey == "" {
+		return errors.New("TRI_ACTOR_API_KEY is empty after defaults (agents would render with no key)")
+	}
 	if c.EgressCallback != "" {
 		// Agents receive the front-side key in their environment (it doubles
 		// as OPEN_TERMINAL_API_KEY) and can reach the shim through the
@@ -260,6 +296,14 @@ func (c *Config) Validate() error {
 		}
 		if c.ConsoleToken == c.APIKey {
 			return errors.New("TRI_CONSOLE_TOKEN must differ from TRI_API_KEY: agents hold the API key and could self-approve egress")
+		}
+		// Agents hold the front-side key and (through the callback tls rule)
+		// reach the shim's callback listener; identity routing there is
+		// driven by headers they control. With the two keys equal, an agent
+		// could proxy to any user's actor. Require a distinct actor key —
+		// the facade translates Authorization headers and WS auth frames.
+		if c.ActorAPIKey == c.APIKey && c.Backend == BackendSubstrate {
+			return errors.New("TRI_ACTOR_API_KEY must differ from TRI_API_KEY when TRI_EGRESS_CALLBACK is set: agents know the API key and could reach other users' actors (set TRI_ACTOR_API_KEY and rebuild the actor template)")
 		}
 	}
 	switch c.Backend {
@@ -307,22 +351,16 @@ func (c *Config) KeyMatches(presented string) bool {
 	if presented == "" {
 		return false
 	}
-	return constantTimeEquals(presented, c.APIKey)
-}
-
-// ConsoleTokenHintOff reports whether the default-token prefill in the
-// console UI is disabled (TRI_CONSOLE_SHOW_DEFAULT=false).
-func (c *Config) ConsoleTokenHintOff() bool {
-	return os.Getenv("TRI_CONSOLE_SHOW_DEFAULT") == "false"
+	return hashEquals(presented, c.APIKey)
 }
 
 // KeyMatchesConsole reports whether the presented token matches the
-// human-only egress console token (constant time).
+// human-only egress console token (constant time on hashed values).
 func (c *Config) KeyMatchesConsole(presented string) bool {
 	if presented == "" || c.ConsoleToken == "" {
 		return false
 	}
-	return constantTimeEquals(presented, c.ConsoleToken)
+	return hashEquals(presented, c.ConsoleToken)
 }
 
 // ActorKeyRewrite distinguishes the (optional) token rewrite mode.
@@ -337,8 +375,8 @@ func envOr(key, def string) string {
 
 func envInt(key string, def int) (int, error) {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
-		var n int
-		if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
 			return 0, fmt.Errorf("%s: %w", key, err)
 		}
 		return n, nil
@@ -368,17 +406,10 @@ func validName(s string) bool {
 	return true
 }
 
-func constantTimeEquals(a, b string) bool {
-	if len(a) != len(b) {
-		// still burn time proportional to len(a) to keep timing flat-ish
-		for i := 0; i < len(a); i++ {
-			_ = a[i]
-		}
-		return false
-	}
-	var v byte
-	for i := 0; i < len(a); i++ {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
+// hashEquals compares two secrets in constant time over their SHA-256
+// digests (crypto/subtle; the digest also hides the key length).
+func hashEquals(a, b string) bool {
+	ha := sha256.Sum256([]byte(a))
+	hb := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
 }

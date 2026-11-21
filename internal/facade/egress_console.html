@@ -38,7 +38,6 @@
 </style>
 </head>
 <body>
-<script>window.__defaultToken = /*DEFAULT_TOKEN_INJECT*/"";</script>
 
 <!-- token settings: top-right key button -->
 <div id="tokwidget" style="position:fixed;top:14px;right:14px;z-index:10;">
@@ -67,9 +66,9 @@ function refreshTokUI() {
   const dot = document.getElementById('tokdot');
   const inp = document.getElementById('tok2');
   const st = document.getElementById('tokstate');
-  if (inp) { if (!saved) { inp.value = window.__defaultToken || ''; inp.type = 'text'; } else { inp.type = 'password'; inp.value = saved; } }
+  if (inp) { if (!saved) { inp.value = ''; inp.type = 'text'; } else { inp.type = 'password'; inp.value = saved; } }
   if (dot) dot.style.display = saved ? 'none' : 'block';
-  if (st) st.textContent = saved ? 'token saved in this browser' : (window.__defaultToken ? 'using the default token (not saved yet)' : 'no token set');
+  if (st) st.textContent = saved ? 'token saved in this browser' : 'no token saved — paste the console token (TRI_CONSOLE_TOKEN) and Save';
 }
 function saveTokPanel() {
   const v = document.getElementById('tok2').value.trim();
