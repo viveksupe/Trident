@@ -1,6 +1,6 @@
-# trident Deployment + Service (in-cluster variant).
-# Rendered by scripts/deploy.sh (values substituted), or applied as-is with a
-# ConfigMap/env approach. The shim needs the RBAC in sa-rbac.yaml.
+# trident Deployment + Services (in-cluster variant).
+# Rendered by scripts/deploy.sh (values substituted). The shim needs the RBAC
+# in sa-rbac.yaml.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -15,7 +15,7 @@ spec:
     matchLabels:
       app: trident
   strategy:
-    type: Recreate # the sqlite session map is a local State at /var/lib/trident
+    type: Recreate # the sqlite state is a local State at /var/lib/trident
   template:
     metadata:
       labels:
@@ -29,11 +29,22 @@ spec:
         env:
         - name: TRI_LISTEN_ADDR
           value: "0.0.0.0:8080"
+        - name: TRI_TLS_LISTEN_ADDR
+          value: ":8443"
+        # Front key: what Open WebUI presents.
         - name: TRI_API_KEY
           valueFrom:
             secretKeyRef:
-              name: trident
+              name: trident-api-key
               key: api-key
+        # Actor key MUST be distinct: agents hold the front key (baked into
+        # the actor as OPEN_TERMINAL_API_KEY) and reach the callback listener,
+        # so a shared key would let an agent proxy to any user's actor.
+        - name: TRI_ACTOR_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: trident-api-key
+              key: actor-api-key
         - name: TRI_BACKEND
           value: "substrate"
         - name: TRI_STATE_DB
@@ -41,24 +52,38 @@ spec:
         - name: TRI_ATESPACE
           value: "${ATESPACE}"
         - name: TRI_TEMPLATE_REF
-          value: "${ATESPACE}/open-terminal"
+          value: "${ATESPACE}/${TEMPLATE_NAME}"
         - name: TRI_ACTOR_PREFIX
-          value: "ot-"
+          value: "tri-"
         - name: TRI_ACTOR_PORT
           value: "${ACTOR_PORT}"
         - name: TRI_IDLE_TTL
           value: "${IDLE_TTL}"
+        - name: TRI_DELETE_IDLE_TTL
+          value: "${DELETE_IDLE_TTL}"
         - name: TRI_MAX_AGE
           value: "${MAX_AGE}"
         - name: TRI_FEATURES_JSON
           value: "${FEATURES_JSON}"
         - name: TRI_EGRESS_HOSTS
           value: "${EGRESS_HOSTS}"
+        # The egress approval flow: console token is human-only (≠ API key).
+        - name: TRI_EGRESS_CALLBACK
+          value: "trident-callback.${TRI_NAMESPACE}.svc:8443"
+        - name: TRI_CONSOLE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: trident-api-key
+              key: console-token
+        - name: TRI_EGRESS_OBSERVER_POD_SELECTOR
+          value: "app=atenet-egress"
         - name: ATE_NAMESPACE
           value: "${ATE_SYSTEM_NAMESPACE}"
         ports:
         - name: http
           containerPort: 8080
+        - name: callback
+          containerPort: 8443
         livenessProbe:
           httpGet:
             path: /healthz
@@ -79,8 +104,21 @@ spec:
             memory: 512Mi
       volumes:
       - name: state
-        emptyDir:
-          sizeLimit: 256Mi
+        persistentVolumeClaim:
+          claimName: trident-state
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: trident-state
+  namespace: ${TRI_NAMESPACE}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
 
 ---
 
@@ -96,3 +134,20 @@ spec:
   - name: http
     port: 80
     targetPort: http
+
+---
+
+# The egress callback entrypoint: actors resolve trident-callback over the
+# pre-approved tls-passthrough rule and the shim terminates TLS on 8443.
+apiVersion: v1
+kind: Service
+metadata:
+  name: trident-callback
+  namespace: ${TRI_NAMESPACE}
+spec:
+  selector:
+    app: trident
+  ports:
+  - name: callback
+    port: 8443
+    targetPort: callback

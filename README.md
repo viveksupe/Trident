@@ -85,9 +85,8 @@ Stop (`DELETE` the session) and continuation (resume from the chat's snapshot).
 | Var | Default | Meaning |
 |---|---|---|
 | `TRI_API_KEY` | (required) | front-side Bearer key Open WebUI presents |
-| `TRI_ACTOR_API_KEY` | = `TRI_API_KEY` | keep equal — WS auth frames pass through unrewritten |
-| `TRI_CONSOLE_TOKEN` | (required with egress flow) | human-only console token (≠ `TRI_API_KEY`); manages the approval UI |
-| `TRI_CONSOLE_SHOW_DEFAULT` | `true` | prefill the default console token on console pages |
+| `TRI_ACTOR_API_KEY` | (required with egress flow; must differ from `TRI_API_KEY`) | actor-side key, baked into the ActorTemplate as `OPEN_TERMINAL_API_KEY`; the facade translates Authorization headers and the first WS auth frame |
+| `TRI_CONSOLE_TOKEN` | (required with egress flow) | human-only console token (≠ `TRI_API_KEY`); manages the approval UI. Never embedded in console pages — save it once in the browser's token widget (🔑, top-right) |
 | `TRI_BACKEND` | `substrate` | `substrate` or `docker` (dev) |
 | `TRI_STATE_DB` | `sessionmap.db` | sqlite chat→actor map + egress bookkeeping |
 | `TRI_LISTEN_ADDR` | `127.0.0.1:8080` | facade address |
@@ -122,10 +121,14 @@ Substrate layout: `manifest/actor` → embedded ActorTemplate,
 
 ## Caveats (known, deliberate)
 
-- **Key:** the shim key and the actor key are the same value by design. Setting
-  `TRI_ACTOR_API_KEY` to something else breaks agent/terminal WebSockets in v1
-  (their auth arrives in the first WS frame, not a header) and is logged as a
-  startup warning.
+- **Keys (security model):** the actor key must be distinct from the front
+  key whenever the egress flow is on. Agents hold the front key (it doubles as
+  `OPEN_TERMINAL_API_KEY` in the sandbox) and can reach the shim's TLS
+  callback listener, so the facade translates credentials outbound:
+  Authorization headers are rewritten, and terminal/agent WebSocket auth
+  frames get the actor key spliced in on their first frame. The callback
+  listener serves ONLY the `/_tri/egress/*` endpoints — never the console or
+  the `/` proxy. The console token is never embedded in any page.
 - **Upgrades:** actor images are digest-pinned; a new template cold-boots every
   chat actor and drops in-memory agent sessions (files persist in the durable
   `/home/user` volume). Deploy in a maintenance window.

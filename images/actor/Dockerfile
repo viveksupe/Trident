@@ -64,9 +64,12 @@ RUN useradd -m -s /bin/bash user && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/s
 
 # Coding agents, installed globally (outside home) so durable volume mounts
 # and snapshots share the binaries while keeping their own credentials.
+# Version-pinned: @latest installs made every rebuild a supply-chain roll.
+ARG CODEX_VERSION=0.171.0
+ARG CLAUDE_CODE_VERSION=2.1.329
 RUN npm install --global --prefix /usr/local --include=optional \
-    @openai/codex@latest \
-    @anthropic-ai/claude-code@latest \
+    "@openai/codex@${CODEX_VERSION}" \
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
 ENV DISABLE_AUTOUPDATER=1
 

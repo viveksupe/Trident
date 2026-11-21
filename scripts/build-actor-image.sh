@@ -2,7 +2,7 @@
 # Build and push the open-terminal actor image, then print the digest-pinned
 # image reference substrate ActorTemplates require (repo@sha256:...).
 #
-# Usage: KOT_REPO=ghcr.io/you/ot-actor ./scripts/build-actor-image.sh [tag]
+# Usage: OCI_REPO=ghcr.io/you/ot-actor ./scripts/build-actor-image.sh [tag]
 set -euo pipefail
 
 REPO="${OCI_REPO:?OCI_REPO=registry.example.com/ot-actor is required (write access needed for the digest lookup)}"

@@ -21,6 +21,11 @@ metadata:
 type: Opaque
 stringData:
   api-key: "${TRI_API_KEY}"
+  # Actor key MUST differ from api-key: agents hold the front key and reach
+  # the callback listener; a shared key lets an agent proxy to any actor.
+  actor-api-key: "${TRI_ACTOR_API_KEY}"
+  # Human-only console token (≠ api-key).
+  console-token: "${TRI_CONSOLE_TOKEN}"
 
 ---
 
@@ -108,4 +113,32 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: trident-ctb
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+# Gateway deny-log reads for the egress observer (the shim tails the
+# atenet-egress envoy container to surface blocked connections as approvals).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trident-pod-logs
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trident-pod-logs
+subjects:
+- kind: ServiceAccount
+  name: trident
+  namespace: ${TRI_NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: trident-pod-logs
   apiGroup: rbac.authorization.k8s.io

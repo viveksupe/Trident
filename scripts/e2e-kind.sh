@@ -11,15 +11,21 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 KEY="${TRI_API_KEY:?TRI_API_KEY is required}"
 CHAT="e2e-$(date +%s)"
+TMP="$(mktemp)"
+trap 'rm -f "${TMP}"' EXIT
 
+# Curl to a temp file first, print after: `curl | head -c` under pipefail
+# aborted the whole run with SIGPIPE whenever a body exceeded the 4 KB cut.
 h() {
   curl -fsS -H "Authorization: Bearer ${KEY}" \
     -H "X-User-Id: e2e" -H "X-Session-Id: ${CHAT}" \
-    "$@" | head -c 4000
+    -o "${TMP}" "$@"
+  head -c 4000 "${TMP}"
 }
 
 echo "==> /api/config (must not require the key nor wake an actor)"
-curl -fsS "${BASE}/api/config" | head -c 4000; echo
+curl -fsS -o "${TMP}" "${BASE}/api/config"
+head -c 4000 "${TMP}"; echo
 
 echo "==> templates must 404"
 code=$(curl -o /dev/null -w '%{http_code}' "${BASE}/api/v1/terminals/templates")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deployment values for scripts/deploy.sh. Copy to manifest/values.sh or export
-# these before running deploy. Only OCI_REPO (write access) and TRI_API_KEY are
-# strictly required to be non-default.
+# these before running deploy. Only OCI_REPO, WORKER_IMAGE and the three
+# secrets below are strictly required.
 
 # The registry repository for the actor image you pushed and built
 # (scripts/build-actor-image.sh prints the exact digest ref it produced).
@@ -11,10 +11,18 @@ export OCI_REPO="ghcr.io/example/ot-actor"
 # build-actor-image.sh for you.
 export ACTOR_IMAGE=""
 
-# The API key Open WebUI will present to the shim (reuse the actor key: the
-# same key is injected into the actor as OPEN_TERMINAL_API_KEY so the WS auth
-# frames pass through untouched).
+# Digest-pinned ateworker image the nodes can pull (what the WorkerPool's
+# workerImage renders as; empty used to silently break fresh clusters).
+export WORKER_IMAGE="ghcr.io/example/ateworker@sha256:fixed"
+
+# Three DISTINCT secrets. The API key is what Open WebUI presents. The actor
+# key is baked into the ActorTemplate as OPEN_TERMINAL_API_KEY — agents hold
+# the front key AND can reach the shim's callback listener, so a shared key
+# would let an agent proxy to any user's actor. The console token gates the
+# human approval console and must not be guessable from either key.
 export TRI_API_KEY="${TRI_API_KEY:-$(openssl rand -hex 24)}"
+export TRI_ACTOR_API_KEY="${TRI_ACTOR_API_KEY:-$(openssl rand -hex 24)}"
+export TRI_CONSOLE_TOKEN="${TRI_CONSOLE_TOKEN:-$(openssl rand -hex 24)}"
 
 # Substrate layout (defaults match the canonical install).
 export ATE_SYSTEM_NAMESPACE="ate-system"
@@ -22,19 +30,22 @@ export TRI_NAMESPACE="trident"
 
 # Atespace for chat actors + the ActorTemplate name.
 export ATESPACE="ots-webui"
+export TEMPLATE_NAME="open-terminal"
 
 # Actor sizing (see internal/backend/substrate/open-terminal-template.yaml).
 export ACTOR_PORT="8000"
 
 # Lifecycle.
 export IDLE_TTL="10m"
+export DELETE_IDLE_TTL="48h"
 export MAX_AGE="168h"
 
 # v1 feature gates: terminal/files/git/agents/notebooks/events on,
 # browser/desktop off (raise these later; the gVisor sandbox needs validation).
 export FEATURES_JSON='{"terminal":true,"notebooks":true,"system":true,"git":true,"events":true,"agents":true,"browser":false,"desktop":false}'
 
-# Egress allowlist (tls_passthrough rules per actor).
+# Egress allowlist (tls_passthrough rules per actor). Set = the full list:
+# it REPLACES the built-in defaults rather than appending.
 export EGRESS_HOSTS="api.anthropic.com,api.openai.com,sentry.io,pypi.org,files.pythonhosted.org,registry.npmjs.org"
 
 # Agent credentials injected into the actor environment.
