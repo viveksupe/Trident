@@ -307,14 +307,17 @@ func isAuthFrame(payload []byte) bool {
 	return json.Unmarshal(payload, &f) == nil && f.Type == "auth"
 }
 
-// rewriteAuthToken replaces the token in an auth frame (key length changes
-// are fine: frames are rebuilt).
+// rewriteAuthToken replaces ONLY the token field of an auth frame, mapping
+// the JSON object so every other field survives verbatim (Open WebUI's auth
+// frames carry cursor, resume, flow_control, chat_id… — the agent protocol
+// aborts turns on cursor gaps, so a {type,token}-only re-marshal would break
+// them even though authentication itself passes).
 func rewriteAuthToken(payload []byte, token string) ([]byte, bool) {
-	var f wsAuthFrame
-	if json.Unmarshal(payload, &f) != nil || f.Type != "auth" {
+	var f map[string]any
+	if json.Unmarshal(payload, &f) != nil || f["type"] != "auth" {
 		return nil, false
 	}
-	f.Token = token
+	f["token"] = token
 	out, err := json.Marshal(f)
 	if err != nil {
 		return nil, false

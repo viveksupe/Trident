@@ -57,12 +57,16 @@ func TestAuthFrameRewrite(t *testing.T) {
 	if !ok {
 		t.Fatal("rewrite failed")
 	}
-	var f wsAuthFrame
+	var f map[string]any
 	if err := json.Unmarshal(out, &f); err != nil {
 		t.Fatal(err)
 	}
-	if f.Token != "actor-secret" {
-		t.Fatalf("token not rewritten: %q", f.Token)
+	if f["token"] != "actor-secret" {
+		t.Fatalf("token not rewritten: %v", f["token"])
+	}
+	// Every other field must survive the rewrite.
+	if f["cursor"] != float64(12) || f["other"] != true {
+		t.Fatalf("auth frame fields dropped by the rewrite: %v", f)
 	}
 	// Non-auth frames pass through untouched.
 	plain := []byte(`{"type":"input","sequence":1,"data":"hi"}`)
