@@ -105,7 +105,11 @@ if [[ -z "${ACTOR_IMAGE}" ]]; then
   ACTOR_IMAGE="$(scripts/build-actor-image.sh | grep 'digest:' | awk '{print $2}')"
   echo "    ${ACTOR_IMAGE}"
 fi
-TRI_IMAGE="${TRI_IMAGE:-trident:dev}"
+# Render-only defaults for manifest/trident/deployment.yaml (exported: envsubst
+# is a child process and sees only the environment — the old bare assignment
+# rendered "image:" empty whenever TRI_IMAGE came from this default).
+export TRI_IMAGE="${TRI_IMAGE:-trident:dev}"
+export TRI_ACTOR_PREFIX="${TRI_ACTOR_PREFIX:-ot-}"
 
 # 1. Worker pool (Kubernetes CRD, not the ate API). The template creates the
 # namespace, so apply BEFORE labelling it (labelling first aborted under

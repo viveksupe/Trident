@@ -1,6 +1,14 @@
-# trident Deployment + Services (in-cluster variant).
-# Rendered by scripts/deploy.sh (values substituted). The shim needs the RBAC
-# in sa-rbac.yaml.
+# trident as the IN-CLUSTER shim/gateway between Open WebUI and the
+# substrate: Deployment + both Services + PVC, a complete envsubst-driven
+# package alongside sa-rbac.yaml. Rendered by scripts/deploy.sh (real
+# values) or scripts/render-manifest.sh (smoke test against the example).
+#
+#   Service trident           :80 -> pod :8080   Open WebUI points HERE
+#   Service trident-callback  :8443 -> pod :8443 actor egress callbacks
+#
+# TRI_BACKEND=substrate is the PRIMARY path (gVisor actors via atenet-router).
+# TRI_BACKEND=docker stays a documented dev/demo fallback — see README
+# "Docker demo mode"; it is not rendered here.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -22,10 +30,19 @@ spec:
         app: trident
     spec:
       serviceAccountName: trident
+      # The shim image already drops to USER trident (images/trident);
+      # enforce it and cap escalation. Full hardening (readOnlyRootFilesystem,
+      # NetworkPolicy, resource caps) is tracked separately as R8.
+      securityContext:
+        runAsNonRoot: true
       containers:
       - name: trident
         image: ${TRI_IMAGE}
         args: ["serve"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         env:
         - name: TRI_LISTEN_ADDR
           value: "0.0.0.0:8080"
@@ -45,6 +62,9 @@ spec:
             secretKeyRef:
               name: trident-api-key
               key: actor-api-key
+        # PRIMARY path: substrate — gVisor actors behind atenet-router.
+        # (TRI_BACKEND=docker is a dev/demo fallback, documented in the
+        # README; the in-cluster deployment never uses it.)
         - name: TRI_BACKEND
           value: "substrate"
         - name: TRI_STATE_DB
@@ -53,8 +73,11 @@ spec:
           value: "${ATESPACE}"
         - name: TRI_TEMPLATE_REF
           value: "${ATESPACE}/${TEMPLATE_NAME}"
+        # Actor-name prefix: envsubst'd from values (it was hardcoded
+        # "tri-", which drifted from the config default "ot-" and broke
+        # reconcile/cleanup scope against an ot- shim — see R8/README).
         - name: TRI_ACTOR_PREFIX
-          value: "tri-"
+          value: "${TRI_ACTOR_PREFIX}"
         - name: TRI_ACTOR_PORT
           value: "${ACTOR_PORT}"
         - name: TRI_IDLE_TTL
@@ -64,7 +87,10 @@ spec:
         - name: TRI_MAX_AGE
           value: "${MAX_AGE}"
         - name: TRI_FEATURES_JSON
-          value: "${FEATURES_JSON}"
+          # Single-quoted: the value itself contains double quotes
+          # ({"terminal":...}); a double-quoted YAML scalar around it renders
+          # invalid YAML and kubectl apply fails (caught by render-manifest).
+          value: '${FEATURES_JSON}'
         - name: TRI_EGRESS_HOSTS
           value: "${EGRESS_HOSTS}"
         # The egress approval flow: console token is human-only (≠ API key).
@@ -96,6 +122,8 @@ spec:
         - name: state
           mountPath: /var/lib/trident
         resources:
+          # The shim is a thin proxy + sqlite: keep it small. The PVC holds
+          # the session/egress store, so memory is connection state only.
           requests:
             cpu: 100m
             memory: 128Mi
@@ -122,6 +150,8 @@ spec:
 
 ---
 
+# The Open WebUI front door: point the Open Terminal integration's URL at
+# this Service (Service :80 -> pod :8080 facade).
 apiVersion: v1
 kind: Service
 metadata:
