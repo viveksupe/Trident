@@ -42,20 +42,29 @@ type Config struct {
 	CallbackHost   string // parsed once in Load
 	CallbackPort   string
 
-	Backend           string // TRI_BACKEND: substrate | docker
-	StateDB           string // TRI_STATE_DB
-	ActorPrefix       string // TRI_ACTOR_PREFIX
-	Atespace          string // TRI_ATESPACE
-	TemplateRef       string // TRI_TEMPLATE_REF "atespace/name"
-	APINamespace      string // TRI_API_NAMESPACE
-	ClientSA          string // TRI_CLIENT_SA
-	RouteNamespace    string // TRI_ROUTE_NAMESPACE
-	RouteSA           string // TRI_ROUTE_SA
-	Dial              string // TRI_DIAL
-	ActorPort         int    // TRI_ACTOR_PORT
-	IdleTTL           time.Duration
-	DeleteIdleTTL     time.Duration // idle before full delete (frees durable volume)
-	MaxAge            time.Duration
+	Backend        string // TRI_BACKEND: substrate | docker
+	StateDB        string // TRI_STATE_DB
+	ActorPrefix    string // TRI_ACTOR_PREFIX
+	Atespace       string // TRI_ATESPACE
+	TemplateRef    string // TRI_TEMPLATE_REF "atespace/name"
+	APINamespace   string // TRI_API_NAMESPACE
+	ClientSA       string // TRI_CLIENT_SA
+	RouteNamespace string // TRI_ROUTE_NAMESPACE
+	RouteSA        string // TRI_ROUTE_SA
+	Dial           string // TRI_DIAL
+	ActorPort      int    // TRI_ACTOR_PORT
+	IdleTTL        time.Duration
+	DeleteIdleTTL  time.Duration // idle before full delete (frees durable volume)
+	MaxAge         time.Duration
+
+	// Actor-creation caps (R3): a new create past either cap fails with
+	// pool.ErrActorCapReached, which the facade serves as 429 with a static
+	// detail. "Live" counts every actor whose sandbox exists and is not yet
+	// fully deleted — ready, suspended-not-deleted and mid-create alike;
+	// existing actors that can only resume are never treated as new
+	// creates. 0 disables a cap (unlimited). See pool.Pool.checkCapLocked.
+	MaxActors         int    // TRI_MAX_ACTORS: global cap on simultaneously live actors
+	MaxActorsPerUser  int    // TRI_MAX_ACTORS_PER_USER: same cap per X-User-Id identity
 	SuspendDurability string // TRI_SUSPEND_DURABILITY: async | sync
 	EgressHosts       []string
 	Features          map[string]bool // TRI_FEATURES_JSON
@@ -92,21 +101,27 @@ func DefaultEgressHosts() []string {
 // ActorAPIKey is derived last, after every alias has had its say.
 func Load() (*Config, error) {
 	c := &Config{
-		ListenAddr:        "127.0.0.1:8080",
-		Backend:           BackendDocker,
-		StateDB:           "sessionmap.db",
-		ActorPrefix:       "ot-",
-		Atespace:          "ots-webui",
-		TemplateRef:       "ots-webui/open-terminal",
-		APINamespace:      "ate-system",
-		ClientSA:          "ate-client",
-		RouteNamespace:    "ate-system",
-		RouteSA:           "atenet-client",
-		Dial:              DialInCluster,
-		ActorPort:         8000,
-		IdleTTL:           10 * time.Minute,
-		DeleteIdleTTL:     48 * time.Hour,
-		MaxAge:            168 * time.Hour,
+		ListenAddr:     "127.0.0.1:8080",
+		Backend:        BackendDocker,
+		StateDB:        "sessionmap.db",
+		ActorPrefix:    "ot-",
+		Atespace:       "ots-webui",
+		TemplateRef:    "ots-webui/open-terminal",
+		APINamespace:   "ate-system",
+		ClientSA:       "ate-client",
+		RouteNamespace: "ate-system",
+		RouteSA:        "atenet-client",
+		Dial:           DialInCluster,
+		ActorPort:      8000,
+		IdleTTL:        10 * time.Minute,
+		DeleteIdleTTL:  48 * time.Hour,
+		MaxAge:         168 * time.Hour,
+		// Header-pair floods (R3): each distinct route key mints its own
+		// 500m/768Mi sandbox, so production ships bounded by default.
+		// 256 ≈ system-wide ceiling; 32 ≈ no legitimate human chat load.
+		// Export 0 explicitly to go unlimited.
+		MaxActors:         256,
+		MaxActorsPerUser:  32,
 		SuspendDurability: "async",
 		Features:          DefaultFeatures(),
 		EgressHosts:       DefaultEgressHosts(),
@@ -160,6 +175,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.MaxAge, err = envDur("TRI_MAX_AGE", c.MaxAge); err != nil {
+		return nil, err
+	}
+	if c.MaxActors, err = envInt("TRI_MAX_ACTORS", c.MaxActors); err != nil {
+		return nil, err
+	}
+	if c.MaxActorsPerUser, err = envInt("TRI_MAX_ACTORS_PER_USER", c.MaxActorsPerUser); err != nil {
 		return nil, err
 	}
 	// TRI_EGRESS_HOSTS REPLACES the default allowlist (an operator may need
@@ -342,6 +363,9 @@ func (c *Config) Validate() error {
 	}
 	if c.IdleTTL <= 0 || c.DeleteIdleTTL <= 0 || c.MaxAge <= 0 {
 		return errors.New("TRI_IDLE_TTL, TRI_DELETE_IDLE_TTL and TRI_MAX_AGE must be positive")
+	}
+	if c.MaxActors < 0 || c.MaxActorsPerUser < 0 {
+		return errors.New("TRI_MAX_ACTORS and TRI_MAX_ACTORS_PER_USER must be >= 0 (0 disables the cap; a negative value would reject every create)")
 	}
 	if !validActorPrefix(c.ActorPrefix) {
 		return fmt.Errorf("TRI_ACTOR_PREFIX %q must be 2-15 lowercase-alphanumeric characters ending in '-'", c.ActorPrefix)
