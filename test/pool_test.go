@@ -156,3 +156,99 @@ func TestPoolMaxAgeDeletion(t *testing.T) {
 		t.Fatal("delete never fired past max age")
 	}
 }
+
+// blockingBackend parks inside EnsureReady until the test releases it, holding
+// a session in the registered-but-handle-less window that the sweep pick loop
+// used to panic in (finding C1).
+type blockingBackend struct {
+	mu       sync.Mutex
+	creates  int
+	suspends int
+	deletes  int
+
+	entered     chan struct{}
+	release     chan struct{}
+	enteredOnce sync.Once
+}
+
+func (b *blockingBackend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend.Handle, backend.Dialer, error) {
+	b.mu.Lock()
+	b.creates++
+	b.mu.Unlock()
+	b.enteredOnce.Do(func() { close(b.entered) })
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	return &backend.Handle{Key: key, Name: "blk", CreatedAt: time.Now()}, nilDialer{}, nil
+}
+
+func (b *blockingBackend) Get(context.Context, model.RouteKey) (*backend.Handle, error) {
+	return nil, nil
+}
+func (b *blockingBackend) Suspend(context.Context, *backend.Handle) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.suspends++
+	return nil
+}
+func (b *blockingBackend) Delete(context.Context, *backend.Handle) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deletes++
+	return nil
+}
+func (b *blockingBackend) ListReady(context.Context) ([]backend.Handle, error) {
+	return nil, nil
+}
+
+// TestPoolSweepSkipsSessionDuringCreate regresses C1: the pick loop used to
+// evaluate now.Sub(ses.handle.CreatedAt) while a session was registered but
+// still inside its first EnsureReady (handle == nil), so any ticker landing
+// inside an actor create panicked the RunTicker goroutine — and with it the
+// whole process. The mid-create session must be skipped, not swept, and the
+// ticker must survive the window.
+func TestPoolSweepSkipsSessionDuringCreate(t *testing.T) {
+	b := &blockingBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// idleTTL 0: any session WITH a handle is sweep-eligible on the next tick,
+	// so inside the blocked create only the nil-handle guard can spare it.
+	pl := pool.New(b, nil, log, 0 /* immediate idle */, time.Hour /* delete */, time.Hour /* max age */)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pl.RunTicker(ctx, 5*time.Millisecond)
+
+	key := model.NewRouteKey("u", "c")
+	var wg sync.WaitGroup
+	var ready pool.Ready
+	var acqErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ready, _, acqErr = pl.Acquire(ctx, key)
+	}()
+
+	<-b.entered // create in progress: session registered, handle still nil
+	// Let several sweep ticks land inside the create window.
+	time.Sleep(50 * time.Millisecond)
+
+	b.mu.Lock()
+	sweeps, deletes := b.suspends, b.deletes
+	b.mu.Unlock()
+	if sweeps != 0 || deletes != 0 {
+		t.Fatalf("session mid-create was swept: suspends=%d deletes=%d", sweeps, deletes)
+	}
+	if n := pl.Count(); n != 1 {
+		t.Fatalf("mid-create session lost from the pool: Count=%d", n)
+	}
+
+	close(b.release)
+	wg.Wait()
+	if acqErr != nil {
+		t.Fatalf("Acquire failed after the create unblocked: %v", acqErr)
+	}
+	if ready.Dialer == nil {
+		t.Fatalf("Acquire handed back a Ready without a dialer")
+	}
+}
