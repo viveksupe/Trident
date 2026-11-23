@@ -10,7 +10,6 @@ package facade
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,34 +37,37 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
-// spliceWS performs the upgrade + token rewrite + frame mirror. It returns a
-// non-zero bool when it took over the connection (success), and false on an
-// unrecoverable setup error — handled before the hijack point, so the caller
-// can still answer through the normal ResponseWriter.
+// spliceWS performs the upgrade + token rewrite + frame mirror. It returns
+// true when the request is fully handled: either the connection was spliced
+// for its lifetime, or an error response was already delivered — through w
+// before the hijack, raw on clientConn after it. It returns false only when it
+// took no action and w was never hijacked, so the caller may fall through to
+// the plain proxy. After Hijack the ResponseWriter is dead: every failure must
+// go raw on clientConn, and none may fall through — routeNoAuth would
+// otherwise re-run the upgrade against a closed writer.
 func (s *Server) spliceWS(w http.ResponseWriter, r *http.Request, ready pool.Ready) bool {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		return false
 	}
-	clientConn, clientBuf, err := hj.Hijack()
-	if err != nil {
-		return false
-	}
-	defer clientConn.Close()
 
-	ctx := context.Background()
+	// Dial the actor BEFORE hijacking: a failure here is answered through the
+	// normal ResponseWriter, and r.Context() ties the dial to the client's
+	// liveness (a background context let a dead client's dial run on).
+	actorConn, err := ready.Dialer.DialConn(r.Context(), "tcp")
 	if err != nil {
-		return false
-	}
-	defer clientConn.Close()
-
-	actorConn, err := ready.Dialer.DialConn(ctx, "tcp")
-	if err != nil {
-		// Connection died before hijack effects reach Open WebUI; answer 503.
 		writeJSON(w, http.StatusBadGateway, detail{"actor connection failed"})
-		return false
+		return true
 	}
 	defer actorConn.Close()
+
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		// The takeover failed before w was consumed: the caller's plain
+		// proxy can still attempt the upgrade through the live writer.
+		return false
+	}
+	defer clientConn.Close()
 
 	actorBuf := bufio.NewReader(actorConn)
 
@@ -92,14 +94,14 @@ func (s *Server) spliceWS(w http.ResponseWriter, r *http.Request, ready pool.Rea
 	req.WriteString("\r\n")
 
 	if _, err := actorConn.Write([]byte(req.String())); err != nil {
-		writeJSON(w, http.StatusBadGateway, detail{"actor connection failed"})
-		return false
+		writeSpliceError(clientConn, "actor connection failed")
+		return true
 	}
 
 	resp, err := http.ReadResponse(actorBuf, r)
 	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
-		writeJSON(w, http.StatusBadGateway, detail{"actor refused the terminal upgrade"})
-		return false
+		writeSpliceError(clientConn, "actor refused the terminal upgrade")
+		return true
 	}
 
 	// Mirror the 101 (status line + WS response headers: Sec-WebSocket-Accept,
@@ -113,7 +115,10 @@ func (s *Server) spliceWS(w http.ResponseWriter, r *http.Request, ready pool.Rea
 	}
 	out.WriteString("\r\n")
 	if _, err := clientConn.Write([]byte(out.String())); err != nil {
-		return false
+		// The client connection already failed mid-response: nothing more
+		// can be delivered on it, but the request was handled — falling
+		// through would run a second upgrade on the hijacked writer.
+		return true
 	}
 
 	// Frames the client already had in flight beyond the upgrade request ride
@@ -121,6 +126,21 @@ func (s *Server) spliceWS(w http.ResponseWriter, r *http.Request, ready pool.Rea
 	// still rewritten.
 	s.mirrorFrames(clientBuf.Reader, clientConn, actorBuf, actorConn)
 	return true
+}
+
+// writeSpliceError delivers an open_terminal-shaped error (502 +
+// {"detail": ...}) directly on a hijacked client connection: after Hijack the
+// ResponseWriter can no longer carry bytes, and routeNoAuth must not fall
+// through to the reverse proxy's second upgrade attempt.
+func writeSpliceError(conn net.Conn, msg string) {
+	body, err := json.Marshal(detail{msg})
+	if err != nil {
+		return // detail is a plain string field; cannot fail in practice
+	}
+	_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n"+
+		"Content-Type: application/json\r\n"+
+		"Content-Length: %d\r\n"+
+		"Connection: close\r\n\r\n%s", len(body), body)
 }
 
 // mirrorFrames rewrites the first client auth frame, then mirrors both

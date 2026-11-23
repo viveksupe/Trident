@@ -3,6 +3,8 @@ package facade
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,4 +295,101 @@ func TestSpliceHugeDeclaredFrame(t *testing.T) {
 			t.Fatal("spliceWS did not return after the oversized frame")
 		}
 	})
+}
+
+// failingDialer fails every dial and counts attempts: spliceWS must dial once,
+// answer the client itself, and never fall through to a second upgrade in the
+// reverse proxy.
+type failingDialer struct{ n atomic.Int32 }
+
+func (d *failingDialer) DialConn(ctx context.Context, _ string) (net.Conn, error) {
+	d.n.Add(1)
+	return nil, errors.New("dial tcp 10.0.0.7:4242: connect: connection refused")
+}
+
+// TestSpliceDialFailureAnsweredOnce (finding S7): before the fix spliceWS
+// hijacked FIRST, then dialed — and answered the failure with writeJSON into
+// the already-hijacked ResponseWriter, whose bytes net/http silently drops.
+// The client then got an abrupt close and routeNoAuth fell through to
+// ReverseProxy.ServeHTTP on the closed writer (a second upgrade RoundTrip).
+// The client must now receive a real error response, and DialConn must be
+// called exactly once — proving no second upgrade attempt ran.
+func TestSpliceDialFailureAnsweredOnce(t *testing.T) {
+	s := newTestServer()
+	dial := &failingDialer{}
+	ready := pool.Ready{Handle: backend.Handle{Name: "down-actor"}, Dialer: dial}
+
+	handled := make(chan bool, 1)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mirrors routeNoAuth (server.go): a handled splice stops; otherwise
+		// the plain proxy runs — which would dial again for the upgrade.
+		if s.spliceWS(w, r, ready) {
+			handled <- true
+			return
+		}
+		handled <- false
+		s.proxyFor(ready).ServeHTTP(w, r)
+	}))
+	defer front.Close()
+
+	conn, _, resp := rawUpgrade(t, front.URL)
+	defer conn.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "actor connection failed") {
+		t.Fatalf("body = %q, want the actor connection failed detail", body)
+	}
+	select {
+	case ok := <-handled:
+		if !ok {
+			t.Fatal("spliceWS reported unhandled — routeNoAuth would run a second upgrade")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("spliceWS did not return after the dial failure")
+	}
+	if got := dial.n.Load(); got != 1 {
+		t.Fatalf("dial attempted %d times — a second upgrade went through", got)
+	}
+}
+
+// TestSpliceActorRefusalDeliveredRaw (finding S7): after the hijack the
+// ResponseWriter is dead, so the actor's non-101 answer must be re-emitted as
+// a raw HTTP response on the client connection (writeJSON there is dropped)
+// and spliceWS must report the request handled.
+func TestSpliceActorRefusalDeliveredRaw(t *testing.T) {
+	s := newTestServer()
+	// A plain HTTP actor: answers the upgrade request with 403 instead of 101.
+	actor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"detail":"no terminal for you"}`)
+	}))
+	defer actor.Close()
+	ready := pool.Ready{
+		Handle: backend.Handle{Name: "refusing-actor"},
+		Dialer: testDialer{addr: actor.Listener.Addr().String()},
+	}
+	handled := make(chan bool, 1)
+	front := spliceFront(s, ready, handled)
+	defer front.Close()
+
+	conn, _, resp := rawUpgrade(t, front.URL)
+	defer conn.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (raw post-hijack response)", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "actor refused the terminal upgrade") {
+		t.Fatalf("body = %q, want the refusal detail", body)
+	}
+	select {
+	case ok := <-handled:
+		if !ok {
+			t.Fatal("spliceWS reported unhandled — routeNoAuth would run a second upgrade")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("spliceWS did not return after the refusal")
+	}
 }

@@ -148,10 +148,11 @@ func (s *Server) routeNoAuth(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.KeyRewriteNeeded() {
 		if isWebSocketUpgrade(r) {
 			if s.spliceWS(w, r, ready) {
-				return // splice owns the connection for its lifetime
+				return // spliced, or an error response already delivered
 			}
-			// Fall through to the plain proxy (it will fail the upgrade with
-			// the translated header only; auth frames would not rewrite).
+			// spliceWS took no action (writer not hijackable): fall through
+			// to the plain proxy, which can still attempt the upgrade with
+			// the translated header only (auth frames would not rewrite).
 		}
 	}
 
