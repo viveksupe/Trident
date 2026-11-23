@@ -172,7 +172,7 @@ func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend
 			// snapshot, then re-creating-if-missing and resuming. Delete —
 			// which purges the actor's durable /home/user volume — is NEVER
 			// reached from a single failure: escalation requires affirmative
-			// (non-transient) Revert evidence in selfHealEscalationN
+			// restore-corruption evidence (DataLoss) in selfHealEscalationN
 			// consecutive EnsureReady calls (finding C3).
 			b.log.Warn("resume failed; attempting self-heal",
 				"actor", name, "key", key.LogString(), "err", err)
@@ -196,6 +196,16 @@ func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend
 					b.log.Error("revert failed definitively; purge withheld pending repeated evidence",
 						"actor", name, "key", key.LogString(),
 						"evidence", strikes, "threshold", selfHealEscalationN, "err", revErr)
+				case revertOperator:
+					// Security review on C3: affirmative-but-not-corruption
+					// refusals (Unimplemented under substrate version skew,
+					// PermissionDenied after an RBAC regression,
+					// InvalidArgument, the benign FailedPrecondition no-op &c.)
+					// are operator configuration problems, never evidence
+					// against the actor's data. Keep the actor, no purge; the
+					// strike chain resets (selfHealDecision).
+					b.log.Error("revert refused for non-corruption reasons; keeping actor, operator action required",
+						"actor", name, "key", key.LogString(), "err", revErr)
 				case revertTransient:
 					// C3: transient Revert failures (deadline, transport,
 					// overload) never escalate to a purge. The recovery below
@@ -441,17 +451,25 @@ const (
 	revertTransient
 	// revertAbsent: the actor is already gone; recreating loses no data.
 	revertAbsent
-	// revertCorruption: the control plane affirmatively (non-transiently)
-	// refused the revert — restore-corruption evidence. Escalates to a purge
-	// only once it repeats selfHealEscalationN times consecutively.
+	// revertCorruption: the control plane affirmatively reported a damaged
+	// snapshot/restore (the DataLoss allowlist). Escalates to a purge only
+	// once it repeats selfHealEscalationN times consecutively.
 	revertCorruption
+	// revertOperator: an affirmative but NON-corruption refusal — version
+	// skew (Unimplemented), RBAC regression (PermissionDenied),
+	// misconfiguration (InvalidArgument), the documented benign no-op
+	// (FailedPrecondition) or any other unclassified affirmative code.
+	// Configuration problems are never corruption evidence: keep the actor,
+	// Error-log with the route key, reset the strike chain, never auto-purge
+	// (security review on C3).
+	revertOperator
 )
 
 // transientRevertCodes lists the gRPC codes attributable to transport,
 // caller deadlines, or load (the A6-retryable subset), plus Internal and
 // Canceled. status.Code reports Unknown for *any* non-gRPC error, so Unknown
-// is deliberately transient too: a purge may only ever be granted on an
-// affirmative, structured, non-retryable answer from the control plane.
+// is deliberately transient too. Neither group can ever grant a purge: that
+// requires affirmative DataLoss (see classifyRevertError).
 var transientRevertCodes = map[codes.Code]bool{
 	codes.Unavailable:       true,
 	codes.DeadlineExceeded:  true,
@@ -477,18 +495,27 @@ func classifyRevertError(err error) revertOutcome {
 	if transientRevertCodes[code] {
 		return revertTransient
 	}
-	// DataLoss is the archetype here; FailedPrecondition, InvalidArgument,
-	// Unimplemented, PermissionDenied &c. are all affirmative server answers
-	// (gRPC A6 non-retryable set) rather than lost-round-trip artifacts.
-	return revertCorruption
+	// Corruption allowlist (security review on C3): only DataLoss
+	// affirmatively describes a damaged snapshot/restore. Every other
+	// affirmative non-transient code — Unimplemented (Revert RPC absent
+	// under version skew), PermissionDenied (RBAC regression),
+	// InvalidArgument, FailedPrecondition (already swallowed as a benign
+	// no-op by Lifecycle.Revert; classified here defensively) or any future
+	// unclassified code — is an operator-action configuration problem, not
+	// evidence against the actor's data: fail closed against purges.
+	if code == codes.DataLoss {
+		return revertCorruption
+	}
+	return revertOperator
 }
 
 // selfHealDecision is the pure escalation classifier: given the actor's
 // previous consecutive-evidence strike count and this call's classified
 // outcome, it returns the updated strike count and whether a purge
 // (Delete — which destroys durable data) is permitted. Only revertCorruption
-// increments the chain; every other outcome resets it to zero, so transient
-// failures alone — or a single definitive failure — can never trigger a
+// (the DataLoss allowlist) increments the chain; every other outcome —
+// transient, operator-action, absent, recovered — resets it to zero, so
+// neither transient failures nor configuration problems can ever trigger a
 // purge, no matter how often they occur.
 func selfHealDecision(prevStrikes int, outcome revertOutcome) (strikes int, purge bool) {
 	if outcome != revertCorruption {

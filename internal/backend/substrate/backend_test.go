@@ -38,12 +38,18 @@ func TestClassifyRevertError(t *testing.T) {
 		{"raw context canceled", context.Canceled, revertTransient},
 		{"wrapped transient (lifecycler wrapping)", wrap(codes.Unavailable, "api pod restarting"), revertTransient},
 		{"wrapped context-style deadline", wrap(codes.DeadlineExceeded, "ctx deadline"), revertTransient},
-		// Affirmative control-plane answers: purge evidence, gated on repeats.
-		{"wrapped data loss", wrap(codes.DataLoss, "snapshot corrupt"), revertCorruption},
-		{"failed precondition", wrap(codes.FailedPrecondition, "bad state"), revertCorruption},
-		{"invalid argument", wrap(codes.InvalidArgument, "bad template"), revertCorruption},
-		{"unimplemented", wrap(codes.Unimplemented, "no such rpc"), revertCorruption},
-		{"permission denied", wrap(codes.PermissionDenied, "rbac"), revertCorruption},
+		// Corruption allowlist (security review on C3): DataLoss alone is
+		// affirmative restore-corruption evidence.
+		{"wrapped data loss (only purge evidence)", wrap(codes.DataLoss, "snapshot corrupt"), revertCorruption},
+		// Affirmative but NON-corruption refusals are operator-action: keep
+		// the actor, Error-log, reset strikes, never auto-purge.
+		{"failed precondition (benign no-op, swallowed by Revert)", wrap(codes.FailedPrecondition, "bad state"), revertOperator},
+		{"invalid argument", wrap(codes.InvalidArgument, "bad template"), revertOperator},
+		{"unimplemented (version skew)", wrap(codes.Unimplemented, "no such rpc"), revertOperator},
+		{"permission denied (RBAC regression)", wrap(codes.PermissionDenied, "rbac"), revertOperator},
+		{"already exists", wrap(codes.AlreadyExists, "dup actor"), revertOperator},
+		{"unauthenticated", wrap(codes.Unauthenticated, "creds"), revertOperator},
+		{"out of range", wrap(codes.OutOfRange, "truncated"), revertOperator},
 		// Actor already gone: recreate, nothing to purge.
 		{"not found", wrap(codes.NotFound, "no such actor"), revertAbsent},
 	}
@@ -157,6 +163,48 @@ func TestSelfHealDecisionRequiresConsecutiveEvidence(t *testing.T) {
 	}
 }
 
+// TestSelfHealDecisionOperatorActionNeverPurges is the security-review
+// regression guard for C3: affirmative non-corruption codes — version skew
+// (Unimplemented), RBAC regressions (PermissionDenied), misconfiguration
+// (InvalidArgument) and the documented benign no-op (FailedPrecondition) —
+// must never increment corruption strikes nor permit a purge, not even from
+// an already-advanced streak; each such outcome resets the chain instead.
+func TestSelfHealDecisionOperatorActionNeverPurges(t *testing.T) {
+	operatorErrs := []error{
+		wrap(codes.Unimplemented, "revert rpc absent (version skew)"),
+		wrap(codes.PermissionDenied, "rbac regression"),
+		wrap(codes.InvalidArgument, "bad template"),
+		wrap(codes.FailedPrecondition, "benign no-op"),
+		wrap(codes.AlreadyExists, "dup actor"),
+		wrap(codes.Unauthenticated, "creds"),
+		wrap(codes.OutOfRange, "truncated"),
+	}
+	for _, err := range operatorErrs {
+		outcome := classifyRevertError(err)
+		if outcome != revertOperator {
+			t.Fatalf("classifyRevertError(%v) = %v, want revertOperator", err, outcome)
+		}
+		// Even from a streak one below threshold: no purge, chain reset.
+		strikes, purge := selfHealDecision(selfHealEscalationN-1, outcome)
+		if purge || strikes != 0 {
+			t.Fatalf("operator outcome from streak %d: strikes=%d purge=%v, want 0/false",
+				selfHealEscalationN-1, strikes, purge)
+		}
+		// Repeated operator outcomes never escalate, however many calls.
+		strikes = 0
+		for call := 1; call <= 100; call++ {
+			strikes, purge = selfHealDecision(strikes, outcome)
+			if purge {
+				t.Fatalf("%v: purge permitted at call %d (strikes=%d)", err, call, strikes)
+			}
+		}
+	}
+	// DataLoss remains the sole code that can ever escalate.
+	if got := classifyRevertError(wrap(codes.DataLoss, "snapshot corrupt")); got != revertCorruption {
+		t.Fatalf("DataLoss must remain the corruption allowlist entry, got %v", got)
+	}
+}
+
 func TestRetryTransientRevert(t *testing.T) {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -203,6 +251,20 @@ func TestRetryTransientRevert(t *testing.T) {
 		}
 		if classifyRevertError(err) != revertCorruption {
 			t.Fatalf("want corruption classification, got %v", classifyRevertError(err))
+		}
+	})
+
+	t.Run("operator-action failures are not retried", func(t *testing.T) {
+		calls := 0
+		err := retryTransientRevert(ctx, log, "shim-x", time.Microsecond, func(context.Context) error {
+			calls++
+			return wrap(codes.Unimplemented, "revert rpc absent (version skew)")
+		})
+		if calls != 1 {
+			t.Fatalf("revert called %d times, want 1 (operator refusals are not transient)", calls)
+		}
+		if classifyRevertError(err) != revertOperator {
+			t.Fatalf("want operator classification, got %v", classifyRevertError(err))
 		}
 	})
 
