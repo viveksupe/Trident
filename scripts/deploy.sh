@@ -69,7 +69,11 @@ ensure_secret() {
       index($0, "export " n "=") == 1 { print "export " n "=\"" v "\""; seen = 1; next }
       { print }
       END { if (!seen) print "export " n "=\"" v "\"" }' "${VALUES}" > "${VALUES}.tmp"
+    # VALUES holds literal secret material from here on: tighten the mode on
+    # both the temp file (pre-mv) and the target, and keep it tight on reruns.
+    chmod 600 "${VALUES}.tmp"
     mv "${VALUES}.tmp" "${VALUES}"
+    chmod 600 "${VALUES}"
     echo "==> persisted ${name} -> ${VALUES}"
   fi
 }
