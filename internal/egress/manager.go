@@ -144,8 +144,19 @@ func (m *Manager) maybeAutoApprove(ctx context.Context, r *Request) error {
 	return nil
 }
 
-// approves the request with the rule's TTL.
+// approves the request with the rule's TTL. Every approval entry point ends
+// up here (console Approve, auto-approve), so this is also where the host
+// guards must live.
 func (m *Manager) approveRequestLocked(ctx context.Context, req Request, ttl time.Duration) error {
+	// Hold the actor's policy lock across patch + grant insertion: revokeGrant
+	// decides from a fresh grant read under this same lock, so the approval
+	// must be atomic with respect to it — otherwise a revoke can read "no
+	// other grant holds the rule", delete the rule, and only afterwards see
+	// this grant appear (live grant, closed host). ("Locked" in the name now
+	// literally holds.)
+	unlock := m.lockPolicy(req.ActorName)
+	defer unlock()
+
 	// Policy patch FIRST, then the bookkeeping in one transaction: a failure
 	// above leaves the request pending (retryable), and approval only lands
 	// when a policy rule actually exists behind it. The old order (approve
@@ -326,14 +337,16 @@ func (m *Manager) RevokeAll(ctx context.Context) (int, error) {
 
 // ClearHistoryRevokeAll revokes every live grant (patching each actor's
 // substrate policy), then drops decided requests and closed grants from the
-// console. Auto-approve rules are untouched (they govern future requests).
+// console. The list is an enumeration only — each decision re-reads its own
+// (actor, host) pair fresh under the policy lock (see revokeGrant).
+// Auto-approve rules are untouched (they govern future requests).
 func (m *Manager) ClearHistoryRevokeAll(ctx context.Context) (revoked int, cleared int64, err error) {
 	live, err := m.store.Live()
 	if err != nil {
 		return 0, 0, err
 	}
 	for _, g := range live {
-		if err := m.revokeGrant(ctx, live, g); err != nil {
+		if err := m.revokeGrant(ctx, g); err != nil {
 			m.log.Warn("clear-history revoke failed", "actor", g.ActorName, "host", g.Host, "err", err)
 			continue
 		}
@@ -354,19 +367,33 @@ func (m *Manager) Revoke(ctx context.Context, grantID int64) error {
 		if g.ID != grantID {
 			continue
 		}
-		return m.revokeGrant(ctx, live, g)
+		return m.revokeGrant(ctx, g)
 	}
 	return fmt.Errorf("grant %d not live", grantID)
 }
 
-// revokeGrant closes one grant. The policy is only patched when no OTHER
-// live grant for the same (actor, host) keeps the rule alive — duplicate
-// grants exist (observed + helper paths) and revoking one must not revoke
-// the access the other bought, nor drop baseline rules the host shares.
-func (m *Manager) revokeGrant(ctx context.Context, live []Grant, g Grant) error {
+// revokeGrant closes one grant. The other-grants check, the policy patch and
+// the bookkeeping stamp all run under the actor's policy lock against a
+// FRESH read of that pair's live grants: duplicate grants for one
+// (actor, host) exist (observed + helper paths produce them), and
+//
+//   - a stale caller snapshot would let two duplicates each believe the other
+//     still holds the shared rule, so neither patches the policy and the host
+//     stays open forever behind zero console rows, and
+//   - an approval landing between the check and the patch must not have its
+//     brand-new rule torn down: approveRequestLocked serializes on this same
+//     lock across patch + grant insert.
+func (m *Manager) revokeGrant(ctx context.Context, g Grant) error {
+	unlock := m.lockPolicy(g.ActorName)
+	defer unlock()
+
+	live, err := m.store.LiveFor(g.ActorName, g.Host)
+	if err != nil {
+		return err
+	}
 	now := time.Now()
 	for _, other := range live {
-		if other.ID == g.ID || other.ActorName != g.ActorName || other.Host != g.Host {
+		if other.ID == g.ID {
 			continue
 		}
 		if other.Expires.IsZero() || other.Expires.After(now) {
@@ -412,7 +439,7 @@ func (m *Manager) sweep(ctx context.Context) {
 	for _, g := range live {
 		if !g.Expires.IsZero() && now.After(g.Expires) {
 			m.log.Info("revoking expired egress grant", "actor", g.ActorName, "host", g.Host)
-			if err := m.revokeGrant(ctx, live, g); err != nil {
+			if err := m.revokeGrant(ctx, g); err != nil {
 				m.log.Warn("revoke failed", "grant", g.ID, "err", err)
 			}
 		}
@@ -445,11 +472,12 @@ func (m *Manager) expireStaleRequests() (int, error) {
 }
 
 // addRule patches the actor's policy: append a tls-passthrough host if
-// absent. Serialized per actor and retried once on update failure
-// (re-fetching the fresh policy metadata first) so a concurrent console /
-// observer write can't wedge the grant behind a stale-version rejection.
+// absent. Retried once on update failure (re-fetching the fresh policy
+// metadata first) so a concurrent console / observer write can't wedge the
+// grant behind a stale-version rejection. The caller must hold
+// lockPolicy(g.ActorName): the check→patch window has to be closed against
+// revokes deciding under the same lock.
 func (m *Manager) addRule(ctx context.Context, g Grant) (err error) {
-	defer m.lockPolicy(g.ActorName)()
 	for attempt := 0; attempt < 2; attempt++ {
 		if err = m.addRuleOnce(ctx, g); err == nil {
 			return nil
@@ -476,9 +504,9 @@ func (m *Manager) addRuleOnce(ctx context.Context, g Grant) error {
 }
 
 // removeRule patches the actor's policy: drop the host's rules (only the
-// refcount-free paths call it — see revokeGrant).
+// refcount-free paths call it — see revokeGrant). The caller must hold
+// lockPolicy(g.ActorName) (see addRule).
 func (m *Manager) removeRule(ctx context.Context, g Grant) (err error) {
-	defer m.lockPolicy(g.ActorName)()
 	for attempt := 0; attempt < 2; attempt++ {
 		var pol *ateapi.EgressPolicy
 		if pol, err = m.lc.GetEgressPolicy(ctx, g.Atespace, g.ActorName); err != nil {
