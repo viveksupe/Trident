@@ -44,7 +44,7 @@ func (s *Server) proxyFor(ready pool.Ready) *httputil.ReverseProxy {
 	transport := actual.(*http.Transport)
 
 	return &httputil.ReverseProxy{
-		Transport: transport,
+		Transport:     transport,
 		FlushInterval: -1,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			// Point the clone at a symbolic host; the Transport dials the actor.
