@@ -2,9 +2,11 @@ package test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -250,5 +252,49 @@ func TestPoolSweepSkipsSessionDuringCreate(t *testing.T) {
 	}
 	if ready.Dialer == nil {
 		t.Fatalf("Acquire handed back a Ready without a dialer")
+	}
+}
+
+// failingBackend never succeeds EnsureReady: a seeded session can never obtain
+// a dialer in this process.
+type failingBackend struct{}
+
+func (failingBackend) EnsureReady(context.Context, model.RouteKey) (*backend.Handle, backend.Dialer, error) {
+	return nil, nil, errors.New("control plane unreachable")
+}
+func (failingBackend) Get(context.Context, model.RouteKey) (*backend.Handle, error) {
+	return nil, nil
+}
+func (failingBackend) Suspend(context.Context, *backend.Handle) error { return nil }
+func (failingBackend) Delete(context.Context, *backend.Handle) error  { return nil }
+func (failingBackend) ListReady(context.Context) ([]backend.Handle, error) {
+	return nil, nil
+}
+
+// TestPoolSeedWithoutDialerFailsAcquire regresses S6: Seed deliberately stores
+// handle-without-dialer (pre-ageing past WarmWindow so the first request walks
+// EnsureReady), and ensure's keep-last-known branch returns a session after a
+// failed EnsureReady without ever populating the dialer. Acquire used to hand
+// that Ready{Dialer: nil} to the facade, whose transport then nil-derefs in
+// DialConn. It must fail with a 502-mapped error carrying the ensure failure
+// instead — while keeping the seed mapping so supervision survives the outage.
+func TestPoolSeedWithoutDialerFailsAcquire(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pl := pool.New(failingBackend{}, nil, log, time.Hour, time.Hour, time.Hour)
+	key := model.NewRouteKey("u", "c")
+	pl.Seed(context.Background(), key, &backend.Handle{Key: key, Name: "ot-u1234-c5678", CreatedAt: time.Now()})
+
+	ready, inf, err := pl.Acquire(context.Background(), key)
+	if err == nil {
+		t.Fatalf("Acquire must fail when no dialer was ever established (the facade would nil-deref), got Ready{Dialer:%v}", ready.Dialer)
+	}
+	if ready.Dialer != nil || inf != nil {
+		t.Fatalf("error return must not carry a Ready/Inflight: dialer=%v inflight=%v", ready.Dialer, inf)
+	}
+	if !strings.Contains(err.Error(), "control plane unreachable") {
+		t.Fatalf("warming error should surface the last EnsureReady failure, got: %v", err)
+	}
+	if n := pl.Count(); n != 1 {
+		t.Fatalf("seed mapping must survive the failed ensure for supervision: Count=%d", n)
 	}
 }

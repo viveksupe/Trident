@@ -4,6 +4,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -24,7 +25,10 @@ type session struct {
 	lastActive time.Time
 	inflight   int64 // open HTTP requests (incl. spliced WS); suspend waits for zero
 	sweeping   bool  // a suspend/delete is running; Acquire waits for it
-	life       sync.Mutex
+	// lastErr is the most recent EnsureReady failure on the keep-last-known
+	// path: surfaced by Acquire when no dialer has ever been established.
+	lastErr error
+	life    sync.Mutex
 }
 
 // Pool reconciles route keys to backend actors.
@@ -66,7 +70,9 @@ func New(b backend.Backend, store *sessionmap.Store, log *slog.Logger, idleTTL, 
 	}
 }
 
-// Ready is the triple Acquire hands to the facade.
+// Ready is the triple Acquire hands to the facade. Dialer is always non-nil:
+// Acquire fails rather than hand back a session that never completed an
+// EnsureReady in this process (Seed after restart, backend outage).
 type Ready struct {
 	Handle backend.Handle
 	Dialer backend.Dialer
@@ -112,7 +118,25 @@ func (p *Pool) Acquire(ctx context.Context, key model.RouteKey) (Ready, *Infligh
 		p.lastSeenDirty[key] = now
 		p.mu.Unlock()
 	}}
-	return Ready{Handle: *ses.handle, Dialer: ses.dialer}, inf, nil
+
+	// A session that has never completed an EnsureReady in this process has
+	// no dialer — Seed stores handle-only on purpose, and the keep-last-known
+	// path can return a seeded session during a backend outage. Handing that
+	// to the proxy nil-derefs in the transport's DialContext, so fail with
+	// the facade's 502-mapped error instead. Snapshot under p.mu (ensure
+	// writes handle/dialer/lastErr there) and release the refcount attach
+	// just took.
+	p.mu.Lock()
+	handle, dialer, lastErr := ses.handle, ses.dialer, ses.lastErr
+	p.mu.Unlock()
+	if handle == nil || dialer == nil {
+		inf.Done()
+		if lastErr != nil {
+			return Ready{}, nil, fmt.Errorf("warming: no dialer yet (last EnsureReady failed: %w)", lastErr)
+		}
+		return Ready{}, nil, errors.New("warming: no dialer yet")
+	}
+	return Ready{Handle: *handle, Dialer: dialer}, inf, nil
 }
 
 // acquireSession resolves the session and registers this caller's refcount.
@@ -199,10 +223,15 @@ func (p *Pool) ensure(ctx context.Context, key model.RouteKey) (*session, error)
 	h, dialer, err := p.backend.EnsureReady(ctx, key)
 	if err != nil {
 		if ses.handle != nil {
-			// Keep serving the warm-but-stale session: if the actor is truly
-			// dead the proxied request surfaces it.
+			// Keep the last-known session: a warm one still has its dialer and
+			// keeps serving (a truly dead actor surfaces in the proxied
+			// request); a cold one (seeded, dialer never established) fails
+			// in Acquire as "warming" instead of being handed out nil.
 			p.log.Warn("backend EnsureReady failed; keeping last-known session",
 				"key", key.LogString(), "err", err)
+			p.mu.Lock()
+			ses.lastErr = err
+			p.mu.Unlock()
 			ses.life.Unlock()
 			return ses, nil
 		}
@@ -222,6 +251,7 @@ func (p *Pool) ensure(ctx context.Context, key model.RouteKey) (*session, error)
 		p.ses[key] = ses
 	}
 	ses.handle, ses.dialer = h, dialer
+	ses.lastErr = nil
 	ses.lastActive = p.now()
 	p.mu.Unlock()
 	if p.store != nil {
