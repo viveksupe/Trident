@@ -15,6 +15,7 @@ package facade
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -120,6 +121,19 @@ func (s *Server) CallbackHandler() http.Handler {
 	return mux
 }
 
+// acquireStatus maps a pool.Acquire failure to (status, detail). Cap
+// exhaustion (R3: TRI_MAX_ACTORS / TRI_MAX_ACTORS_PER_USER) is a load
+// condition — neither a bad request nor an upstream failure — so it gets
+// 429 with a STATIC detail: the raw error names caps, counts and user
+// identities and must not leave the process. Every other failure keeps the
+// warming 502 shape.
+func acquireStatus(err error) (int, detail) {
+	if errors.Is(err, pool.ErrActorCapReached) {
+		return http.StatusTooManyRequests, detail{"actor capacity reached"}
+	}
+	return http.StatusBadGateway, detail{"actor not ready: " + err.Error()}
+}
+
 type detail struct {
 	Detail string `json:"detail"`
 }
@@ -149,7 +163,8 @@ func (s *Server) routeNoAuth(w http.ResponseWriter, r *http.Request) {
 	ready, inflight, err := s.pl.Acquire(r.Context(), key)
 	if err != nil {
 		s.log.Warn("acquire failed", "key", key.LogString(), "path", r.URL.Path, "err", err)
-		writeJSON(w, http.StatusBadGateway, detail{"actor not ready: " + err.Error()})
+		code, d := acquireStatus(err)
+		writeJSON(w, code, d)
 		return
 	}
 	defer inflight.Done()

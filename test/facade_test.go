@@ -212,3 +212,73 @@ func TestFacadeBadKeyVariants(t *testing.T) {
 		t.Fatalf("wrong key must 401, got %d", resp.StatusCode)
 	}
 }
+
+// newFacadeCapped mirrors newFacade on a pool with actor-creation caps (R3).
+func newFacadeCapped(t *testing.T, maxActors, maxActorsPerUser int) *httptest.Server {
+	t.Helper()
+	backendImpl := newFakeBackend()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pl := pool.New(backendImpl, nil, log, time.Minute, time.Hour, time.Hour)
+	pl.AllowSuspend = false
+	pl.MaxActors = maxActors
+	pl.MaxActorsPerUser = maxActorsPerUser
+	s := facade.New(newTestConfig(t), pl, log)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestFacadeActorCapServes429 covers the R3 route-level contract: creates
+// admit up to the cap, the next new header pair gets 429 with a STATIC
+// detail (no caps, counts or identities leak), sessions at the cap keep
+// working, and the per-user cap isolates one user's flood from everyone
+// else.
+func TestFacadeActorCapServes429(t *testing.T) {
+	t.Run("global cap", func(t *testing.T) {
+		srv := newFacadeCapped(t, 1, 0)
+		u1c1 := map[string]string{"X-User-Id": "u1", "X-Session-Id": "c1"}
+
+		resp, _ := do(t, srv, http.MethodGet, "/probe", "test-key", u1c1)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("first create: status = %d, want 200", resp.StatusCode)
+		}
+		resp, body := do(t, srv, http.MethodGet, "/probe", "test-key",
+			map[string]string{"X-User-Id": "u1", "X-Session-Id": "c2"})
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("create past cap: status = %d body = %s, want 429", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, `"detail":"actor capacity reached"`) {
+			t.Fatalf("429 body must carry the static detail, got %s", body)
+		}
+		for _, leak := range []string{"TRI_MAX_ACTORS", "would exceed", `"u1"`} {
+			if strings.Contains(body, leak) {
+				t.Fatalf("429 detail leaks internals (%q): %s", leak, body)
+			}
+		}
+		// The session at the cap keeps serving.
+		resp, _ = do(t, srv, http.MethodGet, "/probe", "test-key", u1c1)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("session at the cap must keep working, status = %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("per-user cap isolates users", func(t *testing.T) {
+		srv := newFacadeCapped(t, 10, 1) // headroom: only the per-user cap fires
+		resp, _ := do(t, srv, http.MethodGet, "/probe", "test-key",
+			map[string]string{"X-User-Id": "user-a", "X-Session-Id": "c1"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("user A first create: status = %d, want 200", resp.StatusCode)
+		}
+		resp, body := do(t, srv, http.MethodGet, "/probe", "test-key",
+			map[string]string{"X-User-Id": "user-a", "X-Session-Id": "c2"})
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("user A past per-user cap: status = %d body = %s, want 429", resp.StatusCode, body)
+		}
+		// User A's cap must not block user B.
+		resp, _ = do(t, srv, http.MethodGet, "/probe", "test-key",
+			map[string]string{"X-User-Id": "user-b", "X-Session-Id": "c1"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("user B must be unaffected by user A's cap, status = %d", resp.StatusCode)
+		}
+	})
+}
