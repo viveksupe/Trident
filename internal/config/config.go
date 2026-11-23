@@ -343,8 +343,8 @@ func (c *Config) Validate() error {
 	if c.IdleTTL <= 0 || c.DeleteIdleTTL <= 0 || c.MaxAge <= 0 {
 		return errors.New("TRI_IDLE_TTL, TRI_DELETE_IDLE_TTL and TRI_MAX_AGE must be positive")
 	}
-	if c.ActorPrefix == "" || !validName(c.ActorPrefix) {
-		return fmt.Errorf("TRI_ACTOR_PREFIX %q must be a DNS-1123-safe prefix ending in '-'", c.ActorPrefix)
+	if !validActorPrefix(c.ActorPrefix) {
+		return fmt.Errorf("TRI_ACTOR_PREFIX %q must be 2-15 lowercase-alphanumeric characters ending in '-'", c.ActorPrefix)
 	}
 	parts := strings.SplitN(c.TemplateRef, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -409,6 +409,27 @@ func envDur(key string, def time.Duration) (time.Duration, error) {
 		return d, nil
 	}
 	return def, nil
+}
+
+// validActorPrefix enforces TRI_ACTOR_PREFIX's documented contract:
+// non-empty, 2..15 characters, all lowercase alphanumeric plus '-', ending
+// in '-', with a lowercase-alphanumeric first rune — so it can actually
+// front a name (rejects "", "-" and "-x", which are DNS-unsafe or ambiguous
+// as a prefix). The 15-char cap is the budget model.ActorName assumes:
+// prefix (<=15) + "u" + 8-hex user hash + "-" + canonicalSegment's 38-char
+// reserve = 63, the maximum DNS-1123 label length; a longer prefix
+// silently overflows it and the first actor create fails.
+func validActorPrefix(s string) bool {
+	if len(s) < 2 || len(s) > 15 {
+		return false
+	}
+	if s[len(s)-1] != '-' {
+		return false
+	}
+	if c := s[0]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
+		return false
+	}
+	return validName(s)
 }
 
 func validName(s string) bool {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -269,6 +270,71 @@ func TestValidateConsoleTokenGating(t *testing.T) {
 		c.ConsoleToken = "human-only-secret"
 		if err := c.Validate(); err != nil {
 			t.Fatalf("distinct console token must validate: %v", err)
+		}
+	})
+}
+
+// TRI_ACTOR_PREFIX must honor its documented contract end to end:
+// 2..15 chars, trailing '-', lowercase-alphanumeric first rune. Before
+// this finding only the charset was checked — "-x", "ot" and over-15-char
+// prefixes (which overflow model.ActorName's 63-char DNS budget:
+// 15 + "u" + 8-hex + "-" + 38) all validated and only failed later, at
+// actor creation time.
+func TestLoadRejectsBadActorPrefix(t *testing.T) {
+	tests := []struct {
+		prefix string
+		ok     bool
+	}{
+		{"ot-", true}, // the default
+		{"tri-", true},
+		{"a-", true},                          // shortest legal prefix
+		{"9x-", true},                         // digit first rune is alphanumeric
+		{strings.Repeat("a", 14) + "-", true}, // exactly 15 chars
+		// An *empty* env value is indistinguishable from unset (envOr):
+		// the default "ot-" survives and Load succeeds. The empty-prefix
+		// contract itself is checked by Validate directly, below.
+		{"", true},
+		{"-", false},                           // 1 char, no first rune of its own
+		{"-x", false},                          // leading dash, no trailing dash
+		{"-ot-", false},                        // leading dash
+		{"ot", false},                          // missing trailing '-'
+		{"OT-", false},                         // uppercase
+		{"ot_x-", false},                       // underscore is not DNS-1123
+		{"a b-", false},                        // space
+		{strings.Repeat("a", 15) + "-", false}, // 16 chars: overflows the 63-char budget
+	}
+
+	for i, tc := range tests {
+		t.Run(fmt.Sprintf("%02d_%q_ok=%v", i, tc.prefix, tc.ok), func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("TRI_API_KEY", "front-key")
+			t.Setenv("TRI_ACTOR_API_KEY", "actor-key")
+			t.Setenv("TRI_ACTOR_PREFIX", tc.prefix)
+			_, err := Load()
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("prefix %q must validate: %v", tc.prefix, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("prefix %q must be rejected", tc.prefix)
+			}
+			if !strings.Contains(err.Error(), "TRI_ACTOR_PREFIX") {
+				t.Fatalf("want a TRI_ACTOR_PREFIX error for %q, got: %v", tc.prefix, err)
+			}
+		})
+	}
+
+	// The empty prefix can only reach Validate through a directly built
+	// Config (env reads fall back to the default above); it must still fail
+	// the documented contract.
+	t.Run("empty prefix rejected by Validate", func(t *testing.T) {
+		c := validConfig()
+		c.ActorPrefix = ""
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "TRI_ACTOR_PREFIX") {
+			t.Fatalf("empty prefix must fail validation, got: %v", err)
 		}
 	})
 }
