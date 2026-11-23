@@ -164,6 +164,13 @@ func serveCmd(log *slog.Logger) error {
 		}
 	}
 	pl := pool.New(backendImpl, store, log, cfg.IdleTTL, cfg.DeleteIdleTTL, cfg.MaxAge)
+	// Actor-creation caps (R3): header-pair floods must not mint unbounded
+	// 500m/768Mi sandboxes; over-cap creates surface as facade 429.
+	pl.MaxActors = cfg.MaxActors
+	pl.MaxActorsPerUser = cfg.MaxActorsPerUser
+	if cfg.MaxActors > 0 || cfg.MaxActorsPerUser > 0 {
+		log.Info("actor creation caps", "max_actors", cfg.MaxActors, "max_actors_per_user", cfg.MaxActorsPerUser)
+	}
 	if egressManager != nil {
 		// Console purges and long-idle sweeps also wipe this actor's egress
 		// bookkeeping (pendings, grants, standing rules).

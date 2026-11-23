@@ -16,6 +16,12 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// ErrActorCapReached reports that admitting this route key as a NEW actor
+// would exceed TRI_MAX_ACTORS (global) or TRI_MAX_ACTORS_PER_USER. The
+// facade maps it via errors.Is to a 429 with a static detail — the wrapped
+// message may name caps and identities for logs but never reaches a client.
+var ErrActorCapReached = errors.New("actor capacity reached")
+
 // session is one live mapping entry. lock ordering: life (per session) THEN
 // mu (pool) — Acquire routes through life, the sweep takes life before its
 // substrate call, so neither can hold both with the outer mutex first.
@@ -48,6 +54,15 @@ type Pool struct {
 	// WarmWindow suppresses per-request EnsureReady when the actor was active
 	// this recently (a backend probe per request adds avoidable latency).
 	WarmWindow time.Duration
+
+	// MaxActors / MaxActorsPerUser are the creation caps (R3): 0 disables a
+	// cap (pool default; config.Load ships production 256/32). Wire them
+	// from config before the first Acquire. "Live" for the count = ready,
+	// mid-create AND suspended-not-deleted actors; resuming an existing
+	// actor never counts as a create, and a completed full delete (sweep or
+	// console purge) frees its slot. See checkCapLocked.
+	MaxActors        int
+	MaxActorsPerUser int
 
 	sf  singleflight.Group
 	mu  sync.Mutex
@@ -194,6 +209,71 @@ func (p *Pool) attach(key model.RouteKey, ses *session) bool {
 	}
 }
 
+// checkCapLocked admits at most MaxActors / MaxActorsPerUser NEW actors.
+// Callers hold p.mu and have verified no session is registered for key —
+// the check and the registration below it happen in one critical section,
+// so concurrent creates serialize here and cannot jointly overshoot a cap.
+//
+// The count is derived rather than maintained: a live actor is a registered
+// session ∪ a sessionmap row without one. The union counts every state
+// exactly once —
+//
+//	mid-create:  registered, row not yet written  → session
+//	ready:       both                            → session (row excluded)
+//	suspended:   slot dropped, row kept          → row
+//	restarted:   rows seed or await their request → row
+//
+// and frees on both sides at once (full delete drops the slot and the row;
+// a failed create drops the rolled-back slot), so no decrement bookkeeping
+// can drift. A row for key means the sandbox exists: this registration only
+// RESUMES it, so it is admitted unconditionally — existing sessions keep
+// working at the cap. Without a store (dev/test pools) only registered
+// sessions count; production always persists (TRI_STATE_DB).
+//
+// Rows are read only on this cold create path (never per request). A store
+// read error fails OPEN: a cap check must not take the proxy down with a
+// transient sqlite hiccup.
+func (p *Pool) checkCapLocked(key model.RouteKey) error {
+	if p.MaxActors <= 0 && p.MaxActorsPerUser <= 0 {
+		return nil // caps disabled
+	}
+	var rows map[model.RouteKey]sessionmap.Entry
+	if p.store != nil {
+		var err error
+		if rows, err = p.store.All(); err != nil {
+			p.log.Warn("actor cap check: store read failed; allowing create", "err", err)
+			return nil
+		}
+	}
+	if _, exists := rows[key]; exists {
+		return nil // resume of an existing actor, not a new create
+	}
+	live, userLive := len(p.ses), 0
+	for k := range p.ses {
+		if k.UserID == key.UserID {
+			userLive++
+		}
+	}
+	for rk := range rows {
+		if _, registered := p.ses[rk]; registered {
+			continue // counted via its session already
+		}
+		live++
+		if rk.UserID == key.UserID {
+			userLive++
+		}
+	}
+	if p.MaxActors > 0 && live+1 > p.MaxActors {
+		return fmt.Errorf("creating %s would exceed TRI_MAX_ACTORS=%d (live %d): %w",
+			key.LogString(), p.MaxActors, live, ErrActorCapReached)
+	}
+	if p.MaxActorsPerUser > 0 && userLive+1 > p.MaxActorsPerUser {
+		return fmt.Errorf("creating %s would exceed TRI_MAX_ACTORS_PER_USER=%d (user live %d): %w",
+			key.LogString(), p.MaxActorsPerUser, userLive, ErrActorCapReached)
+	}
+	return nil
+}
+
 // ensure returns the session (life NOT held — callers attach afterwards),
 // verifying/warming the actor in the backend when the last known-active
 // point is stale. life is held only across the backend interaction, so a
@@ -215,6 +295,14 @@ func (p *Pool) ensure(ctx context.Context, key model.RouteKey) (*session, error)
 			p.mu.Unlock()
 			ses.life.Unlock()
 			return p.ensure(ctx, key)
+		}
+		// Creation cap (R3): checked here, in the same critical section as
+		// the registration, so the check→create gap is atomic under p.mu.
+		// A rejected create registers nothing — no residue, no slot held.
+		if err := p.checkCapLocked(key); err != nil {
+			p.mu.Unlock()
+			ses.life.Unlock()
+			return nil, err
 		}
 		p.ses[key] = ses
 		p.mu.Unlock()
@@ -475,6 +563,10 @@ func (p *Pool) AcquireForSweep(key model.RouteKey) (backend.Handle, bool) {
 // — the snapshot preserves the session). No EnsureReady call: seeding must
 // not resume every suspended actor at once (a thundering herd after a busy
 // restart); the first real request resumes on demand.
+//
+// Seeding never counts as a new create (R3): the sessionmap row it comes
+// from already counts against the actor caps — checkCapLocked sees row and
+// session as one actor — so reconcile neither inflates nor bypasses them.
 func (p *Pool) Seed(_ context.Context, key model.RouteKey, handle *backend.Handle) {
 	p.mu.Lock()
 	if _, ok := p.ses[key]; ok {
