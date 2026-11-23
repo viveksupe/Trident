@@ -30,7 +30,7 @@ const (
 type Config struct {
 	ListenAddr   string // TRI_LISTEN_ADDR
 	APIKey       string // TRI_API_KEY  (front-side key; REQUIRED)
-	ActorAPIKey  string // TRI_ACTOR_API_KEY (defaults to APIKey)
+	ActorAPIKey  string // TRI_ACTOR_API_KEY (falls back to APIKey, which Validate rejects — a separate secret is required)
 	ConsoleToken string // TRI_CONSOLE_TOKEN (REQUIRED when the egress flow is on; must differ from TRI_API_KEY)
 
 	// EgressCallback, when set ("host" or "host:port", e.g.
@@ -296,24 +296,31 @@ func (c *Config) Validate() error {
 		return errors.New("TRI_ACTOR_API_KEY is empty after defaults (agents would render with no key)")
 	}
 	if c.EgressCallback != "" {
-		// Agents receive the front-side key in their environment (it doubles
-		// as OPEN_TERMINAL_API_KEY) and can reach the shim through the
-		// callback rule, so the console token MUST be a separate human-only
-		// secret — otherwise an in-sandbox agent could self-approve.
+		// The egress flow must stay human-only: sandboxes are rendered with
+		// the actor key (OPEN_TERMINAL_API_KEY) and are let through the
+		// callback rule to this process, so the console token MUST be its
+		// own secret — separate from the front-side key, which every Open
+		// WebUI component presents — or anything holding that key could
+		// self-approve egress.
 		if c.ConsoleToken == "" {
 			return errors.New("TRI_CONSOLE_TOKEN is required when TRI_EGRESS_CALLBACK is set (must be distinct from TRI_API_KEY — agents know the API key)")
 		}
 		if c.ConsoleToken == c.APIKey {
 			return errors.New("TRI_CONSOLE_TOKEN must differ from TRI_API_KEY: agents hold the API key and could self-approve egress")
 		}
-		// Agents hold the front-side key and (through the callback tls rule)
-		// reach the shim's callback listener; identity routing there is
-		// driven by headers they control. With the two keys equal, an agent
-		// could proxy to any user's actor. Require a distinct actor key —
-		// the facade translates Authorization headers and WS auth frames.
-		if c.ActorAPIKey == c.APIKey && c.Backend == BackendSubstrate {
-			return errors.New("TRI_ACTOR_API_KEY must differ from TRI_API_KEY when TRI_EGRESS_CALLBACK is set: agents know the API key and could reach other users' actors (set TRI_ACTOR_API_KEY and rebuild the actor template)")
-		}
+	}
+	// Actor-key distinctness is enforced UNCONDITIONALLY — no egress gate,
+	// no backend condition. The sandbox environment (OPEN_TERMINAL_API_KEY)
+	// is rendered with the actor key on both backends, so distinct keys are
+	// what keep the front-side credential (the one Open WebUI presents to the
+	// facade) out of every sandbox, and what makes the facade's
+	// Authorization-header and WS auth-frame translation — which only
+	// engages when the keys differ — protect actors at all. Until per-actor
+	// key injection lands (a distinct key per actor instead of one org-wide
+	// secret), separation is enforced at this key layer: fail startup loudly
+	// rather than silently collapse the two keys.
+	if c.ActorAPIKey == c.APIKey {
+		return errors.New("TRI_ACTOR_API_KEY must differ from TRI_API_KEY: an equal key puts the front-side credential in every sandbox, letting in-sandbox agents authenticate to the facade as any user (set TRI_ACTOR_API_KEY to a separate secret and rebuild the actor template)")
 	}
 	switch c.Backend {
 	case BackendSubstrate, BackendDocker:
