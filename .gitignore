@@ -5,3 +5,5 @@
 *.db-shm
 /tmp/
 .DS_Store
+# prebuilt shim binary (untracked in R9): build via scripts/build-trident.sh
+/trident
