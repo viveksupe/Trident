@@ -25,6 +25,7 @@ type fakeControl struct {
 	getActorCalls    int
 	createActorCalls int
 	resumeCalls      int
+	deleteActorCalls int
 
 	// egress policy singleton
 	policy            *ateapi.EgressPolicy
@@ -71,6 +72,22 @@ func (f *fakeControl) ResumeActor(_ context.Context, _ *ateapi.ResumeActorReques
 	defer f.mu.Unlock()
 	f.resumeCalls++
 	return &ateapi.ResumeActorResponse{}, nil
+}
+
+// DeleteActor drops the fake's singleton actor (and its policy, which
+// belongs to the actor) so the next EnsureReady recreates it — the churn
+// and terminal-eviction tests cycle actors through this.
+func (f *fakeControl) DeleteActor(_ context.Context, _ *ateapi.DeleteActorRequest, _ ...grpc.CallOption) (*ateapi.Actor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteActorCalls++
+	if f.actor == nil {
+		return nil, status.Error(codes.NotFound, "actor not found")
+	}
+	a := proto.Clone(f.actor).(*ateapi.Actor)
+	f.actor = nil
+	f.policy = nil
+	return a, nil
 }
 
 func (f *fakeControl) GetActorEgressPolicy(_ context.Context, _ *ateapi.GetActorEgressPolicyRequest, _ ...grpc.CallOption) (*ateapi.EgressPolicy, error) {

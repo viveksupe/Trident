@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,14 +50,27 @@ type Backend struct {
 	actorAPIKey string
 	durability  ateapi.DurabilityMode
 	log         *slog.Logger
-	// per-actor lifecycle op serialization
-	ops sync.Map // actor name -> *sync.Mutex
+	// ops is the bounded per-actor lifecycle op table: name -> opEntry
+	// (finding R3 — the old sync.Map was insert-only and grew forever with
+	// actor churn). Records are evicted at terminal points of this backend's
+	// ownership model (Delete, self-heal purge) and capped at opCacheMax
+	// with oldest-first eviction as a safety net. Only lockOp/evictOp touch
+	// the table: Backend.Get and Handle.Key never consult it, so evicting a
+	// record cannot change caller-visible behavior — the next op re-creates
+	// it.
+	ops opCache
+	// opCacheMax caps ops; <= 0 selects defaultOpCacheMax (set from
+	// TRI_OPS_CACHE_MAX in NewBackend).
+	opCacheMax int
 	// selfHealStrikes tracks, per actor name, how many *consecutive*
 	// EnsureReady calls have produced affirmative restore-corruption evidence
 	// (finding C3). Delete — which purges the actor's durable /home/user
 	// volume — is only permitted at selfHealEscalationN strikes. Entries are
 	// cleared on success, on any non-corruption outcome, and after a purge,
-	// so the map stays bounded.
+	// and are dropped together with the op record when a terminal Delete
+	// evicts them (finding R3). Entries are only ever created for actors
+	// that showed restore-corruption evidence, so any residue is bounded by
+	// corrupt-actor names, not by actor churn.
 	selfHealStrikes sync.Map // actor name -> int
 }
 
@@ -120,6 +135,7 @@ func NewBackend(log *slog.Logger, cfg *config.Config) (backend.Backend, error) {
 		actorAPIKey: cfg.ActorAPIKey,
 		durability:  durability,
 		log:         log,
+		opCacheMax:  opCacheMaxFromEnv(),
 	}, nil
 }
 
@@ -132,19 +148,168 @@ func envDefault(key, def string) string {
 	return def
 }
 
-// opLock returns a per-actor mutex, serializing lifecycle ops per actor.
-func (b *Backend) opLock(name string) *sync.Mutex {
-	m, _ := b.ops.LoadOrStore(name, &sync.Mutex{})
-	return m.(*sync.Mutex)
+// defaultOpCacheMax bounds the op table when TRI_OPS_CACHE_MAX is unset or
+// invalid: far above any real shim's actor count (the pool keeps concurrent
+// actors to dozens) while still a hard ceiling.
+const defaultOpCacheMax = 4096
+
+// opEntry is one actor's lifecycle op mutex plus its insertion sequence
+// (oldest-first eviction at the cap).
+type opEntry struct {
+	mu  sync.Mutex
+	seq uint64
+}
+
+// opCache is a bounded actor-name -> opEntry table (finding R3).
+//
+// Correctness invariants:
+//
+//   - A goroutine runs a lifecycle op only while holding the entry that is
+//     CURRENT in the table for its name: lock re-checks after acquiring and
+//     retries against the replacement record otherwise. This is what makes
+//     eviction safe — a waiter that fetched a record evicted from under it
+//     detects the staleness and re-serializes instead of running
+//     concurrently with the holder of the replacement record.
+//   - Eviction never removes a record whose mutex is held: cap eviction
+//     TryLocks candidates (TryLock never blocks, so it cannot deadlock
+//     against lock's verify, which takes c.mu while holding an entry), and
+//     terminal eviction is performed by the op holding the record itself.
+//
+// The cap is best-effort under load: if every record at the cap is mid-op,
+// an insert may temporarily exceed it — the ceiling is then
+// max(opCacheMax, in-flight lifecycle ops), still bounded.
+type opCache struct {
+	mu      sync.Mutex
+	entries map[string]*opEntry
+	seq     uint64
+}
+
+// lock acquires (creating and cap-evicting as needed) the record for name
+// and returns its unlock function, which must be called exactly once.
+func (c *opCache) lock(name string, max int) func() {
+	for {
+		c.mu.Lock()
+		if c.entries == nil {
+			c.entries = make(map[string]*opEntry)
+		}
+		e, ok := c.entries[name]
+		if !ok {
+			c.evictForCapLocked(max)
+			e = &opEntry{seq: c.seq}
+			c.seq++
+			c.entries[name] = e
+		}
+		c.mu.Unlock()
+
+		e.mu.Lock()
+		c.mu.Lock()
+		current := c.entries[name] == e
+		c.mu.Unlock()
+		if current {
+			return e.mu.Unlock
+		}
+		// Evicted while we waited: drop the stale record and re-serialize on
+		// whatever is current now (an evicted record is re-created on next
+		// use — tradeoff documented on the struct).
+		e.mu.Unlock()
+	}
+}
+
+// evictForCapLocked makes room for one more record by removing the OLDEST
+// entry whose op is not in flight; if the oldest is mid-op the next-oldest
+// goes instead, so a single long-running op cannot defeat the cap. Caller
+// holds c.mu.
+func (c *opCache) evictForCapLocked(max int) {
+	if max <= 0 || len(c.entries) < max {
+		return
+	}
+	type candidate struct {
+		name string
+		e    *opEntry
+	}
+	list := make([]candidate, 0, len(c.entries))
+	for n, e := range c.entries {
+		list = append(list, candidate{n, e})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].e.seq < list[j].e.seq })
+	for _, x := range list {
+		if x.e.mu.TryLock() {
+			delete(c.entries, x.name)
+			x.e.mu.Unlock()
+			return
+		}
+	}
+	// Every record at the cap is mid-op: allowing one more is bounded by
+	// the number of concurrent lifecycle ops.
+}
+
+// remove drops name's record. The caller must hold the record's op (via
+// lock) so nothing is running under it.
+func (c *opCache) remove(name string) {
+	c.mu.Lock()
+	delete(c.entries, name)
+	c.mu.Unlock()
+}
+
+// size reports the number of records (tests / diagnostics).
+func (c *opCache) size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}
+
+// lockOp serializes lifecycle ops per actor on the bounded table (finding
+// R3; replaces the insert-only sync.Map). Evicted records are re-created on
+// next use with identical locking semantics for callers.
+func (b *Backend) lockOp(name string) func() {
+	max := b.opCacheMax
+	if max <= 0 {
+		max = defaultOpCacheMax
+	}
+	return b.ops.lock(name, max)
+}
+
+// evictOp drops ALL of name's per-actor bookkeeping — the op record and the
+// self-heal strike chain — at a terminal point in this backend's ownership
+// model. Callers MUST hold name's op (lockOp) so no other op runs under the
+// record being removed.
+//
+// Deliberately NOT called for actors that can still resume (Suspend, every
+// EnsureReady failure classification): keeping their records preserves
+// serialization across retries and is conservative — an unnecessary record
+// costs a few bytes, a wrongly-dropped strike chain would delay a justified
+// purge.
+func (b *Backend) evictOp(name string) {
+	b.ops.remove(name)
+	b.selfHealStrikes.Delete(name)
+}
+
+// opCacheMaxFromEnv reads TRI_OPS_CACHE_MAX (max per-actor op-table
+// records); unset, invalid or non-positive falls back to defaultOpCacheMax.
+func opCacheMaxFromEnv() int {
+	if v := os.Getenv("TRI_OPS_CACHE_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultOpCacheMax
 }
 
 // EnsureReady creates the actor if missing, resumes it if suspended, and
 // returns a tunnel dialer for its HTTP port.
 func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend.Handle, backend.Dialer, error) {
 	name := key.ActorName(b.prefix)
-	mu := b.opLock(name)
-	mu.Lock()
-	defer mu.Unlock()
+	unlock := b.lockOp(name)
+	// purged marks the terminal self-heal delete below; the deferred
+	// eviction runs while the op is still held (evict, then unlock) so no
+	// other op can slip in under the record being dropped (finding R3).
+	purged := false
+	defer func() {
+		if purged {
+			b.evictOp(name)
+		}
+		unlock()
+	}()
 
 	var created time.Time
 	existing, err := b.lc.GetActor(ctx, b.atspace, name)
@@ -188,8 +353,13 @@ func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend
 				if delErr := b.lc.Delete(ctx, b.atspace, name); delErr != nil {
 					return nil, nil, fmt.Errorf("delete during self-heal: %w", delErr)
 				}
-				b.clearSelfHealStrikes(name) // fresh actor, fresh evidence chain
-				created = time.Time{}        // dropped its durable volume with it
+				// Terminal for this actor instance: the deferred eviction
+				// drops the op record AND the strike chain (fresh actor,
+				// fresh evidence chain) — finding R3. A FAILED purge delete
+				// returns above instead, deliberately keeping strikes so the
+				// evidence chain can retry the purge on the next failure.
+				purged = true
+				created = time.Time{} // dropped its durable volume with it
 			} else {
 				switch outcome {
 				case revertCorruption:
@@ -266,17 +436,27 @@ func (b *Backend) Get(ctx context.Context, key model.RouteKey) (*backend.Handle,
 
 // Suspend checkpoints the actor (MEMORY fidelity keeps agent processes).
 func (b *Backend) Suspend(ctx context.Context, h *backend.Handle) error {
-	mu := b.opLock(h.Name)
-	mu.Lock()
-	defer mu.Unlock()
+	// A suspended actor can always resume, so its record is kept — only
+	// terminal delete evicts (finding R3, conservative side).
+	unlock := b.lockOp(h.Name)
+	defer unlock()
 	return b.lc.Suspend(ctx, b.atspace, h.Name, b.durability)
 }
 
 // Delete destroys the actor.
 func (b *Backend) Delete(ctx context.Context, h *backend.Handle) error {
-	mu := b.opLock(h.Name)
-	mu.Lock()
-	defer mu.Unlock()
+	unlock := b.lockOp(h.Name)
+	defer func() {
+		// Terminal for this actor in our ownership model — evict whether the
+		// delete completed or failed (finding R3): completed → nothing left
+		// to serialize; failed → unknown control-plane state whose next
+		// contact is a fresh EnsureReady, and a stale strike chain must not
+		// count against a possibly-recreated actor (clearing only ever
+		// delays a purge, never causes one). Evicting under the op keeps
+		// lockOp's staleness check sound.
+		b.evictOp(h.Name)
+		unlock()
+	}()
 	return b.lc.Delete(ctx, b.atspace, h.Name)
 }
 
