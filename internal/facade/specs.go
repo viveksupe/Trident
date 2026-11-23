@@ -146,9 +146,13 @@ func (s *Server) serveSpec(w http.ResponseWriter, r *http.Request) {
 	buf := &bytes.Buffer{}
 	sw := &specRecorder{ResponseWriter: w, buf: buf}
 	s.routeAs(r, sw, specFetchKey)
-	if sw.code == http.StatusOK {
+	if sw.code == http.StatusOK && !sw.overflowed {
 		// save() skips an empty body (a HEAD miss records nothing), so a
-		// HEAD can never poison the cache with a bodiless response.
+		// HEAD can never poison the cache with a bodiless response; the
+		// overflow gate keeps an oversized capture from ever reaching save —
+		// save's own size check would pass a captured PREFIX (≤4 MiB) and
+		// persist a truncated spec over a valid cached one. save()'s shape
+		// validation is unchanged.
 		s.specs.save(s.cfg.TemplateRef, r.URL.Path, buf.Bytes())
 	}
 }
@@ -168,11 +172,21 @@ func (s *Server) routeAs(r *http.Request, w http.ResponseWriter, key model.Route
 	s.proxyFor(ready).ServeHTTP(w, r)
 }
 
+// specCaptureLimit bounds how much of a proxied response serveSpec buffers
+// for caching: the same 4 MiB ceiling save() enforces, applied DURING
+// capture instead of only at save time — without it, an actor answering a
+// spec path with an arbitrarily large body pinned that much RAM per
+// concurrent cache miss (specs.go's recorder used to buffer unbounded).
+const specCaptureLimit = 4 << 20
+
 // specRecorder tees the proxied response body so a 200 can be cached.
 type specRecorder struct {
 	http.ResponseWriter
 	buf  *bytes.Buffer
 	code int
+	// overflowed marks that capture stopped at specCaptureLimit; serveSpec
+	// must not save a truncated capture.
+	overflowed bool
 }
 
 func (s *specRecorder) WriteHeader(code int) {
@@ -184,6 +198,21 @@ func (s *specRecorder) Write(b []byte) (int, error) {
 	if s.code == 0 {
 		s.code = http.StatusOK
 	}
-	s.buf.Write(b)
+	// Bound the CAPTURE, not the response: the client always receives the
+	// whole body (the return below is the underlying Write's result). Once
+	// the next bytes would exceed specCaptureLimit the recorder stops
+	// buffering — overflow bytes are discarded, never truncated into the
+	// buffer (the buffer can never exceed the cap) — and flags overflowed so
+	// serveSpec skips save(). CHOICE vs aborting the capture outright: the
+	// response keeps streaming to the client (aborting would either truncate
+	// its body or throw away a serviceable response to protect the cache),
+	// and the cost is only that oversized content is not cached — the next
+	// poll refetches while any previously cached file stays untouched.
+	if !s.overflowed && s.buf.Len()+len(b) > specCaptureLimit {
+		s.overflowed = true
+	}
+	if !s.overflowed {
+		s.buf.Write(b)
+	}
 	return s.ResponseWriter.Write(b)
 }
