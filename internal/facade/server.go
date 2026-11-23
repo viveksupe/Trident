@@ -82,7 +82,14 @@ func (s *Server) Handler() http.Handler {
 	// Spec + doc pages are served from the template cache first — no actor is
 	// needed to serve static content, so keyless polls stopped spinning up the
 	// adhoc sandbox.
-	for _, p := range []string{"GET /openapi.json", "GET /docs", "GET /redoc"} {
+	//
+	// Registered WITHOUT a method prefix so every method reaches serveSpec
+	// and non-GET/HEAD is answered 405 there: with a "GET /..." pattern the
+	// mux lets method-mismatched requests fall through to the authenticated
+	// "/" proxy instead (net/http never 405s while another pattern matches).
+	// HEAD still matches these patterns, and serveSpec serves it from cache
+	// (the server strips the body itself).
+	for _, p := range []string{"/openapi.json", "/docs", "/redoc"} {
 		mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) {
 			s.serveSpec(w, r)
 		})
