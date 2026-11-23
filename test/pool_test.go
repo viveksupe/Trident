@@ -3,17 +3,21 @@ package test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/viveksupe/Trident/internal/backend"
 	"github.com/viveksupe/Trident/internal/model"
 	"github.com/viveksupe/Trident/internal/pool"
+	"github.com/viveksupe/Trident/internal/sessionmap"
 )
 
 // countingBackend records lifecycle calls.
@@ -296,5 +300,214 @@ func TestPoolSeedWithoutDialerFailsAcquire(t *testing.T) {
 	}
 	if n := pl.Count(); n != 1 {
 		t.Fatalf("seed mapping must survive the failed ensure for supervision: Count=%d", n)
+	}
+}
+
+// --- Actor-creation caps (finding R3) ---
+
+// capBackend is a lifecycle backend whose handle names are unique per route
+// (countingBackend returns "a" for every key, which would make a single
+// ForgetByActorName drop unrelated sessions).
+type capBackend struct {
+	mu      sync.Mutex
+	creates int
+}
+
+func (c *capBackend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend.Handle, backend.Dialer, error) {
+	c.mu.Lock()
+	c.creates++
+	c.mu.Unlock()
+	return &backend.Handle{Key: key, Name: key.ActorName("cap-"), CreatedAt: time.Now()}, nilDialer{}, nil
+}
+
+func (c *capBackend) Get(ctx context.Context, key model.RouteKey) (*backend.Handle, error) {
+	return nil, nil
+}
+func (c *capBackend) Suspend(ctx context.Context, h *backend.Handle) error { return nil }
+func (c *capBackend) Delete(ctx context.Context, h *backend.Handle) error  { return nil }
+func (c *capBackend) ListReady(ctx context.Context) ([]backend.Handle, error) {
+	return nil, nil
+}
+
+// TestPoolActorCapBlocksNewCreates: creates admit up to MaxActors, the next
+// NEW route fails with the facade-mapped sentinel, and the rejected create
+// leaves no residue while sessions at the cap keep working.
+func TestPoolActorCapBlocksNewCreates(t *testing.T) {
+	b := &capBackend{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pl := pool.New(b, nil, log, time.Minute, time.Hour, time.Hour)
+	pl.MaxActors = 2
+	ctx := context.Background()
+
+	k1, k2, k3 := model.NewRouteKey("u", "c1"), model.NewRouteKey("u", "c2"), model.NewRouteKey("u", "c3")
+	for _, k := range []model.RouteKey{k1, k2} {
+		if _, inflight, err := pl.Acquire(ctx, k); err != nil {
+			t.Fatalf("create to cap (%s): %v", k.LogString(), err)
+		} else {
+			inflight.Done()
+		}
+	}
+
+	_, inflight, err := pl.Acquire(ctx, k3)
+	if !errors.Is(err, pool.ErrActorCapReached) {
+		t.Fatalf("create past cap: err = %v, want ErrActorCapReached", err)
+	}
+	if inflight != nil {
+		t.Fatal("a capped create must not hand back an in-flight ref")
+	}
+	if n := pl.Count(); n != 2 {
+		t.Fatalf("Count = %d, want 2 (a rejected create registers nothing)", n)
+	}
+	// An existing session keeps working while the pool sits at the cap.
+	if _, _, err := pl.Acquire(ctx, k1); err != nil {
+		t.Fatalf("existing session must keep working at the cap: %v", err)
+	}
+}
+
+// TestPoolActorCapFreesSlotOnDelete: a completed console purge (full
+// delete) releases its slot for the next create.
+func TestPoolActorCapFreesSlotOnDelete(t *testing.T) {
+	b := &capBackend{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pl := pool.New(b, nil, log, time.Minute, time.Hour, time.Hour)
+	pl.MaxActors = 1
+	ctx := context.Background()
+
+	ready, inflight, err := pl.Acquire(ctx, model.NewRouteKey("u", "c1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inflight.Done()
+
+	k2 := model.NewRouteKey("u", "c2")
+	if _, _, err := pl.Acquire(ctx, k2); !errors.Is(err, pool.ErrActorCapReached) {
+		t.Fatalf("second create at cap=1: err = %v, want ErrActorCapReached", err)
+	}
+
+	pl.ForgetByActorName(ready.Handle.Name) // console-side full delete
+	if _, _, err := pl.Acquire(ctx, k2); err != nil {
+		t.Fatalf("a deleted actor must free its slot: %v", err)
+	}
+}
+
+// TestPoolActorCapCountsSuspendedAndExemptsResume covers both edges of the
+// R3 counting rules with a persisted store (what production has): a
+// suspended actor's pool slot drops but its sessionmap row keeps it
+// counted, while re-acquiring that same route is a RESUME of an existing
+// sandbox and must pass the cap untouched.
+func TestPoolActorCapCountsSuspendedAndExemptsResume(t *testing.T) {
+	b := &capBackend{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store, err := sessionmap.Open(filepath.Join(t.TempDir(), "cap.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	pl := pool.New(b, store, log, 0 /* immediate idle */, time.Hour /* delete-idle */, time.Hour)
+	pl.MaxActors = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pl.RunTicker(ctx, 5*time.Millisecond)
+
+	k1 := model.NewRouteKey("u", "c1")
+	if _, inflight, err := pl.Acquire(ctx, k1); err != nil {
+		t.Fatalf("first create: %v", err)
+	} else {
+		inflight.Done()
+	}
+
+	// Wait for the suspend that drops the map slot (delete-idle/max-age
+	// stay at 1h, so only the suspend branch can fire).
+	suspended := false
+	for i := 0; i < 100 && !suspended; i++ {
+		if pl.Count() == 0 {
+			suspended = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !suspended {
+		t.Fatalf("suspend never dropped the slot (Count=%d)", pl.Count())
+	}
+
+	// Row ⇒ existing sandbox ⇒ resume, not a new create: must pass at cap.
+	if _, inflight, err := pl.Acquire(ctx, k1); err != nil {
+		t.Fatalf("resume of a suspended actor hit the cap: %v", err)
+	} else {
+		defer inflight.Done()
+	}
+	// A genuinely new route must fail: the suspended actor still counts.
+	if _, _, err := pl.Acquire(ctx, model.NewRouteKey("u", "c2")); !errors.Is(err, pool.ErrActorCapReached) {
+		t.Fatalf("suspended actor must still count against the cap, got %v", err)
+	}
+}
+
+// TestPoolPerUserCapIsolatesUsers: one user at their cap must not block
+// another user (global cap has headroom, so only TRI_MAX_ACTORS_PER_USER
+// can fire).
+func TestPoolPerUserCapIsolatesUsers(t *testing.T) {
+	b := &capBackend{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pl := pool.New(b, nil, log, time.Minute, time.Hour, time.Hour)
+	pl.MaxActors = 10
+	pl.MaxActorsPerUser = 1
+	ctx := context.Background()
+
+	if _, inflight, err := pl.Acquire(ctx, model.NewRouteKey("u1", "c1")); err != nil {
+		t.Fatalf("first create: %v", err)
+	} else {
+		inflight.Done()
+	}
+	if _, _, err := pl.Acquire(ctx, model.NewRouteKey("u1", "c2")); !errors.Is(err, pool.ErrActorCapReached) {
+		t.Fatalf("same user past per-user cap: err = %v, want ErrActorCapReached", err)
+	}
+	if _, inflight, err := pl.Acquire(ctx, model.NewRouteKey("u2", "c1")); err != nil {
+		t.Fatalf("per-user cap leaked across users: %v", err)
+	} else {
+		inflight.Done()
+	}
+}
+
+// TestPoolActorCapFloodBounded floods distinct header pairs concurrently:
+// exactly MaxActors admit, every refusal is the sentinel, no rejected
+// create leaves residue — and the run stays race-clean under -race because
+// the cap check and the registration share one p.mu critical section.
+func TestPoolActorCapFloodBounded(t *testing.T) {
+	b := &capBackend{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pl := pool.New(b, nil, log, time.Minute, time.Hour, time.Hour)
+	pl.MaxActors = 4
+	ctx := context.Background()
+
+	const flood = 40
+	var admitted, capped atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < flood; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, inflight, err := pl.Acquire(ctx, model.NewRouteKey("u", fmt.Sprintf("c%d", i)))
+			switch {
+			case err == nil:
+				admitted.Add(1)
+				inflight.Done()
+			case errors.Is(err, pool.ErrActorCapReached):
+				capped.Add(1)
+			default:
+				t.Errorf("flood request %d: unexpected error %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if admitted.Load() != 4 {
+		t.Fatalf("admitted = %d, want exactly MaxActors=4", admitted.Load())
+	}
+	if capped.Load() != flood-4 {
+		t.Fatalf("capped = %d, want %d", capped.Load(), flood-4)
+	}
+	if n := pl.Count(); n != 4 {
+		t.Fatalf("Count = %d after the flood, want 4", n)
 	}
 }
