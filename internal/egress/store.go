@@ -250,7 +250,11 @@ func (s *Store) DecideApproved(id int64, ttl time.Duration) (Request, Grant, err
 	if err != nil {
 		return Request{}, Grant{}, err
 	}
-	defer func() { if tx != nil { _ = tx.Rollback() } }()
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
 
 	now := time.Now().UnixNano()
 	res, err := tx.Exec(
@@ -455,10 +459,40 @@ func (s *Store) HistoryPaged(limit, offset int) ([]Request, int, error) {
 	return out, total, rows.Err()
 }
 
-// Live returns grants not yet revoked.
+// Live returns every unrevoked grant, oldest first (stable order: revoke
+// loops enumerate this list once; each decision then re-reads LiveFor).
 func (s *Store) Live() ([]Grant, error) {
 	rows, err := s.db.Query(`SELECT id,request_id,atespace,actor_name,host,granted,expires,revoked
-		FROM egress_grants WHERE revoked=0`)
+		FROM egress_grants WHERE revoked=0 ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Grant
+	for rows.Next() {
+		var g Grant
+		var granted, expires, revoked int64
+		if err := rows.Scan(&g.ID, &g.RequestID, &g.Atespace, &g.ActorName, &g.Host,
+			&granted, &expires, &revoked); err != nil {
+			return nil, err
+		}
+		g.Granted, g.Expires = time.Unix(0, granted), time.Unix(0, expires)
+		if revoked != 0 {
+			g.Revoked = time.Unix(0, revoked)
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// LiveFor returns the live grants for one (actor, host) pair, oldest first.
+// It is the fresh read revoke decisions need: duplicate grants for the same
+// host are normal, and a caller-side snapshot taken before a concurrent
+// approval or revocation would mis-count who still holds the shared rule.
+func (s *Store) LiveFor(actor, host string) ([]Grant, error) {
+	rows, err := s.db.Query(`SELECT id,request_id,atespace,actor_name,host,granted,expires,revoked
+		FROM egress_grants WHERE actor_name=? AND host=? AND revoked=0 ORDER BY id ASC`,
+		actor, host)
 	if err != nil {
 		return nil, err
 	}
