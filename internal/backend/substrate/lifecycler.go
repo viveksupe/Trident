@@ -200,6 +200,13 @@ func (l *Lifecycle) desiredCallbackRules() []*ateapi.EgressRule {
 // patch only on drift. EnsureReady calls it on every pass, so a failed create
 // or a TRI_EGRESS_HOSTS change heals on the next request instead of stranding
 // the actor deny-by-default forever.
+//
+// The ensure only ever ADDS or repairs desired rules: rules for hosts that no
+// longer appear in TRI_EGRESS_HOSTS stay in place on existing actors, because
+// the lifecycler cannot tell a stale base-allowlist rule from a live
+// egress-approval grant (their bookkeeping lives in the egress manager's
+// store). Base-host removal therefore takes effect on newly created actors
+// and via the egress console's revoke path, not via this ensure.
 func (l *Lifecycle) EnsureEgressPolicy(ctx context.Context, atespace, name string) error {
 	return l.ensureEgressRules(ctx, atespace, name, l.desiredEgressRules())
 }
