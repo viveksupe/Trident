@@ -13,18 +13,29 @@ import (
 	"time"
 
 	"github.com/viveksupe/Trident/third_party/ateapi"
-
-	"github.com/viveksupe/Trident/internal/backend/substrate"
 )
 
 // ActorChecker resolves an actor-name claim to (exists, atespace) so a
 // request cannot reference an actor the shim does not manage.
 type ActorChecker func(ctx context.Context, actorName string) (atespace string, ok bool, err error)
 
+// PolicyClient is the seam between the approval flow and the substrate's
+// singleton per-actor egress policy. *substrate.Lifecycle implements it in
+// production (wired in cmd/trident); tests substitute an in-memory fake,
+// which is what makes the revoke/approve interleavings testable at all —
+// the concrete Lifecycle requires a live control plane.
+type PolicyClient interface {
+	// GetEgressPolicy returns the actor's singleton policy, or nil when the
+	// actor has no policy yet.
+	GetEgressPolicy(ctx context.Context, atespace, name string) (*ateapi.EgressPolicy, error)
+	// UpdateEgressPolicy replaces the actor's singleton policy.
+	UpdateEgressPolicy(ctx context.Context, atespace, name string, pol *ateapi.EgressPolicy) error
+}
+
 // Manager wires the store to substrate policies.
 type Manager struct {
 	store *Store
-	lc    *substrate.Lifecycle
+	lc    PolicyClient
 	log   *slog.Logger
 	check ActorChecker
 	// ActorPrefix scopes which gateway-observed actors the observer claims.
@@ -55,8 +66,8 @@ func (m *Manager) actorPrefix() string { return m.ActorPrefix }
 // checker is exposed for the observer.
 func (m *Manager) checkerFor() ActorChecker { return m.check }
 
-// New constructs the manager.
-func New(store *Store, lc *substrate.Lifecycle, check ActorChecker, log *slog.Logger) *Manager {
+// New constructs the manager. lc is the policy seam (see PolicyClient).
+func New(store *Store, lc PolicyClient, check ActorChecker, log *slog.Logger) *Manager {
 	return &Manager{store: store, lc: lc, check: check, log: log, RequestTTL: 24 * time.Hour, MaxPendingPerActor: 50}
 }
 
