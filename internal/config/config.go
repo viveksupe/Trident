@@ -129,13 +129,22 @@ func Load() (*Config, error) {
 	c.Dial = envOr("TRI_DIAL", c.Dial)
 	c.SuspendDurability = envOr("TRI_SUSPEND_DURABILITY", c.SuspendDurability)
 
-	c.APIKey = os.Getenv("TRI_API_KEY")
-	c.ConsoleToken = os.Getenv("TRI_CONSOLE_TOKEN")
-	c.EgressCallback = os.Getenv("TRI_EGRESS_CALLBACK")
-	// ActorAPIKey derives LAST: aliases then env, falling back to the front
-	// key (a distinct key is enforced by Validate when the egress flow
-	// demands it).
-	c.ActorAPIKey = envOr("TRI_ACTOR_API_KEY", c.APIKey)
+	// The three secrets ride the same envOr(TRI_X, seeded) chain as every
+	// other field: TRI_* wins when set, but an *unset* TRI_* must no longer
+	// wipe the OTS_* value applyLegacyAliases seeded above — the documented
+	// legacy migration path has to work with OTS_* names alone. ActorAPIKey
+	// keeps its own seed too, so OTS_ACTOR_API_KEY survives.
+	c.APIKey = envOr("TRI_API_KEY", c.APIKey)
+	c.ConsoleToken = envOr("TRI_CONSOLE_TOKEN", c.ConsoleToken)
+	c.EgressCallback = envOr("TRI_EGRESS_CALLBACK", c.EgressCallback)
+	c.ActorAPIKey = envOr("TRI_ACTOR_API_KEY", c.ActorAPIKey)
+	// The front-key fallback derives only AFTER the alias merge: OTS_API_KEY
+	// alone must yield ActorAPIKey == APIKey, not an empty key. Whether that
+	// fallback is acceptable to Validate is decided there, once every alias
+	// and env read has had its say.
+	if c.ActorAPIKey == "" {
+		c.ActorAPIKey = c.APIKey
+	}
 	if c.EgressCallback != "" {
 		c.CallbackHost, c.CallbackPort = splitCallback(c.EgressCallback)
 	}
