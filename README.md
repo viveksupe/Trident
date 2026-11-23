@@ -98,6 +98,8 @@ Stop (`DELETE` the session) and continuation (resume from the chat's snapshot).
 | `TRI_IDLE_TTL` | `10m` | idle → suspend (snapshot, pod freed) |
 | `TRI_DELETE_IDLE_TTL` | `48h` | idle → full purge (frees the durable volume) |
 | `TRI_MAX_AGE` | `168h` | hard cap from creation |
+| `TRI_MAX_ACTORS` | `256` | cap on simultaneously live actors (ready, suspended-not-deleted and mid-create); a create past it → `429 actor capacity reached`. `0` = unlimited |
+| `TRI_MAX_ACTORS_PER_USER` | `32` | same cap per `X-User-Id`: one user's header-pair flood cannot block other users (global cap still applies). `0` = unlimited |
 | `TRI_SUSPEND_DURABILITY` | `async` | `async` (fast, node-local then background upload) or `sync` |
 | `TRI_EGRESS_HOSTS` | anthropic/openai/pypi/npm… | per-actor tls-passthrough allowlist |
 | `TRI_FEATURES_JSON` | core on, browser/desktop off | the `/api/config` features map |

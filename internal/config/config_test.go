@@ -19,6 +19,7 @@ func clearEnv(t *testing.T) {
 		"TRI_ATESPACE", "TRI_TEMPLATE_REF", "TRI_API_NAMESPACE", "TRI_CLIENT_SA",
 		"TRI_ROUTE_NAMESPACE", "TRI_ROUTE_SA", "TRI_DIAL", "TRI_ACTOR_PORT",
 		"TRI_IDLE_TTL", "TRI_DELETE_IDLE_TTL", "TRI_MAX_AGE",
+		"TRI_MAX_ACTORS", "TRI_MAX_ACTORS_PER_USER",
 		"TRI_SUSPEND_DURABILITY", "TRI_EGRESS_HOSTS", "TRI_FEATURES_JSON",
 		// OTS_* legacy aliases.
 		"OTS_LISTEN_ADDR", "OTS_API_KEY", "OTS_ACTOR_API_KEY", "OTS_CONSOLE_TOKEN",
@@ -129,6 +130,51 @@ func TestLoadLegacyAliasChain(t *testing.T) {
 				t.Fatalf("Load: %v", err)
 			}
 			tc.check(t, c)
+		})
+	}
+}
+
+// The actor-creation caps (R3): defaults bound production out of the box,
+// an explicit 0 opts back into unlimited, and a negative value is rejected
+// (it would reject every create).
+func TestLoadActorCaps(t *testing.T) {
+	clearEnv(t)
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantG   int
+		wantU   int
+		wantErr string
+	}{
+		{name: "defaults", wantG: 256, wantU: 32},
+		{name: "explicit zero is unlimited", env: map[string]string{"TRI_MAX_ACTORS": "0", "TRI_MAX_ACTORS_PER_USER": "0"}, wantG: 0, wantU: 0},
+		{name: "custom", env: map[string]string{"TRI_MAX_ACTORS": "8", "TRI_MAX_ACTORS_PER_USER": "2"}, wantG: 8, wantU: 2},
+		{name: "negative rejected", env: map[string]string{"TRI_MAX_ACTORS": "-1"}, wantErr: "TRI_MAX_ACTORS"},
+		{name: "non-numeric rejected", env: map[string]string{"TRI_MAX_ACTORS_PER_USER": "many"}, wantErr: "TRI_MAX_ACTORS_PER_USER"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			// Required distinct secrets so validation passes and the caps
+			// are the only thing under test.
+			t.Setenv("TRI_API_KEY", "front-cap-test")
+			t.Setenv("TRI_ACTOR_API_KEY", "actor-cap-test")
+			t.Setenv("TRI_CONSOLE_TOKEN", "console-cap-test")
+			c, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error naming %s, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.MaxActors != tc.wantG || c.MaxActorsPerUser != tc.wantU {
+				t.Fatalf("caps = (%d, %d), want (%d, %d)", c.MaxActors, c.MaxActorsPerUser, tc.wantG, tc.wantU)
+			}
 		})
 	}
 }
