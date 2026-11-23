@@ -96,7 +96,13 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	mux.HandleFunc("/", s.route)
-	s.RegisterEgress(mux)
+	// The HUMAN egress console is part of this LAN surface; the actor-facing
+	// callback endpoints are NOT — they live on CallbackHandler's TLS
+	// listener alone (see the Handler doc above). Mounting the full
+	// RegisterEgress here (console AND actor routes) defeated that documented
+	// split: any LAN client could file egress requests and poll statuses with
+	// nothing but a header.
+	s.RegisterEgressConsole(mux)
 	return mux
 }
 

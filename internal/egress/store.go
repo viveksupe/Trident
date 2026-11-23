@@ -357,6 +357,13 @@ func (s *Store) PendingCountForActor(actor string) (int, error) {
 	return n, err
 }
 
+// PendingCount reports the GLOBAL open-request count (global flood cap).
+func (s *Store) PendingCount() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM egress_requests WHERE status='pending'`).Scan(&n)
+	return n, err
+}
+
 // list runs a query with optional args and scans requests.
 func (s *Store) list(q string, args ...any) ([]Request, error) {
 	rows, err := s.db.Query(q, args...)
