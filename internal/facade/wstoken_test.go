@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -28,14 +29,27 @@ func TestWSFrameCodecRoundTrip(t *testing.T) {
 		[]byte(`{"type":"auth","token":"front-key","cursor":0}`),
 		bytes.Repeat([]byte("x"), 125),
 		bytes.Repeat([]byte("y"), 60000),  // 16-bit extended length
-		bytes.Repeat([]byte("z"), 200000),  // 64-bit extended length
+		bytes.Repeat([]byte("z"), 200000), // 64-bit extended length
 	} {
 		var buf bytes.Buffer
 		head := byte(0x81) // FIN + text
 		if err := writeMaskedFrame(&buf, head, payload); err != nil {
 			t.Fatalf("write: %v", err)
 		}
+		wire := buf.Bytes()
 		f, err := readWSFrame(bufio.NewReader(&buf))
+		if len(payload) > maxScanPayload {
+			// Over the scan cap (finding C2) readWSFrame must refuse to
+			// buffer and hand back the consumed header for raw replay.
+			var big oversizeFrame
+			if !errors.As(err, &big) {
+				t.Fatalf("oversized frame: err = %v, want oversizeFrame", err)
+			}
+			if want := wire[:len(wire)-len(payload)]; !bytes.Equal(big.raw, want) {
+				t.Fatalf("replayed header mismatch: %d vs %d bytes", len(big.raw), len(want))
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
