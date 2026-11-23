@@ -9,8 +9,10 @@ package facade
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -145,6 +147,21 @@ func (s *Server) mirrorFrames(clientBuf *bufio.Reader, clientConn net.Conn, acto
 		for i := 0; i < 8; i++ {
 			f, err := readWSFrame(clientBuf)
 			if err != nil {
+				var big oversizeFrame
+				if errors.As(err, &big) {
+					// Not the auth frame (that is a small JSON object):
+					// replay every header byte consumed so far and let the
+					// raw splice below carry the payload — it is never
+					// buffered, so the client-declared 64-bit length can
+					// neither OOM nor panic the process.
+					if _, werr := actorConn.Write(big.raw); werr != nil {
+						return
+					}
+					break
+				}
+				// EOF or RFC 6455 violation (control frames carry at most
+				// 125 bytes): drop the connection — the teardown closes
+				// both sides.
 				return
 			}
 			if f.opcode == 0x1 && isAuthFrame(f.payload) {
@@ -208,17 +225,56 @@ type wsFrame struct {
 	payload []byte
 }
 
-// readWSFrame reads one frame from r. Control frames (2-3 KiB budgets) and
-// oversized frames follow the same path; the shim speaks no extensions.
+// maxScanPayload bounds what the pre-auth frame scan will buffer. The auth
+// frame is a few hundred bytes of JSON; the length field it would otherwise
+// allocate from is a client-controlled 64-bit value, and readWSFrame runs in
+// a goroutine that net/http does not recover — a huge make([]byte, ln) would
+// OOM or panic the whole process, and several small frames could smuggle
+// gigabytes through the unconstrained budget first.
+const maxScanPayload = 64 << 10
+
+// errControlPayload reports an RFC 6455 violation: control frames (opcode
+// >= 0x8, e.g. ping/close) must carry at most 125 bytes. The splice drops
+// the connection when the scan sees one.
+var errControlPayload = errors.New("ws: control frame payload exceeds 125 bytes")
+
+// errInvalidLength reports a 64-bit length whose reserved most-significant
+// bit is set (RFC 6455 forbids it). As int64 such a value decodes negative,
+// slipping past every upper-bound check straight into make([]byte, ln) — an
+// attacker-controlled process kill. The connection is dropped.
+var errInvalidLength = errors.New("ws: frame length sets the reserved most-significant bit")
+
+// oversizeFrame reports a data frame whose declared payload exceeds
+// maxScanPayload. raw holds every header byte consumed so far — head,
+// extended length and mask key — for byte-exact replay before the raw splice
+// resumes; the payload itself is streamed, never buffered.
+type oversizeFrame struct {
+	raw []byte
+	ln  int64
+}
+
+func (e oversizeFrame) Error() string {
+	return fmt.Sprintf("ws: declared payload %d exceeds the %d-byte scan cap", e.ln, maxScanPayload)
+}
+
+// readWSFrame reads one frame header (and, within the scan cap, its payload)
+// from r. Control frames obey RFC 6455's 125-byte rule — violations return
+// errControlPayload so the caller drops the connection. Oversized data frames
+// return oversizeFrame carrying the consumed header bytes instead of ever
+// allocating from a client-declared 64-bit length; the shim speaks no
+// extensions.
 func readWSFrame(r *bufio.Reader) (wsFrame, error) {
+	var consumed bytes.Buffer
 	head, err := r.ReadByte()
 	if err != nil {
 		return wsFrame{}, err
 	}
+	consumed.WriteByte(head)
 	h2, err := r.ReadByte()
 	if err != nil {
 		return wsFrame{}, err
 	}
+	consumed.WriteByte(h2)
 	opcode := head & 0x0f
 	masked := h2&0x80 != 0
 	ln := int64(h2 & 0x7f)
@@ -228,22 +284,34 @@ func readWSFrame(r *bufio.Reader) (wsFrame, error) {
 		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return wsFrame{}, err
 		}
+		consumed.Write(b[:])
 		ln = int64(b[0])<<8 | int64(b[1])
 	case 127:
 		var b [8]byte
 		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return wsFrame{}, err
 		}
+		consumed.Write(b[:])
 		ln = 0
 		for _, c := range b {
 			ln = ln<<8 | int64(c)
 		}
+	}
+	if ln < 0 {
+		return wsFrame{}, errInvalidLength
+	}
+	if opcode&0x8 != 0 && ln > 125 {
+		return wsFrame{}, errControlPayload
 	}
 	mask := [4]byte{}
 	if masked {
 		if _, err := io.ReadFull(r, mask[:]); err != nil {
 			return wsFrame{}, err
 		}
+		consumed.Write(mask[:])
+	}
+	if ln > maxScanPayload {
+		return wsFrame{}, oversizeFrame{raw: consumed.Bytes(), ln: ln}
 	}
 	payload := make([]byte, ln)
 	if _, err := io.ReadFull(r, payload); err != nil {
