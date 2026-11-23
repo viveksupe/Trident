@@ -47,7 +47,27 @@ type Server struct {
 
 // New builds the facade server.
 func New(cfg *config.Config, pl *pool.Pool, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, pl: pl, log: log, specs: newSpecCache(filepath.Dir(cfg.StateDB))}
+	s := &Server{cfg: cfg, pl: pl, log: log, specs: newSpecCache(filepath.Dir(cfg.StateDB))}
+	// Subscribe to the pool's delete path (R3): the per-actor proxy caches
+	// (transports/dialers) must die with the actor they are keyed by, or
+	// every actor ever swept pins an *http.Transport, a dialer and map
+	// entries — plus their idle keep-alive conns — for the process lifetime.
+	// The hook is a single slot and main.go registers the egress purge on it
+	// BEFORE calling New (main.go:170 vs :218), so compose: chain ours behind
+	// whatever is already registered. Callers must not assign
+	// OnActorDeleted AFTER New — that would replace this subscription
+	// (nothing in-repo does; the console purge path fires no hook at all, so
+	// actorsDelete evicts inline via evictActor).
+	if pl != nil {
+		prev := pl.OnActorDeleted
+		pl.OnActorDeleted = func(actorName string) {
+			if prev != nil {
+				prev(actorName)
+			}
+			s.evictActor(actorName)
+		}
+	}
+	return s
 }
 
 // SetEgress attaches the approval manager (nil-able); call before Handler.

@@ -155,6 +155,11 @@ func (s *Server) actorsDelete(w http.ResponseWriter, r *http.Request) {
 		if s.pl != nil {
 			s.pl.ForgetByActorName(body.Name)
 		}
+		// ForgetByActorName only purges pool map slots + the session row — it
+		// fires no OnActorDeleted hook — so the per-actor proxy caches must
+		// go here too, or every console-deleted actor pins its Transport,
+		// dialer and idle conns (R3).
+		s.evictActor(body.Name)
 		if s.egress != nil {
 			_ = s.egress.PurgeActor(ctx, body.Name)
 		}

@@ -44,7 +44,7 @@ func (s *Server) proxyFor(ready pool.Ready) *httputil.ReverseProxy {
 	transport := actual.(*http.Transport)
 
 	return &httputil.ReverseProxy{
-		Transport: transport,
+		Transport:     transport,
 		FlushInterval: -1,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			// Point the clone at a symbolic host; the Transport dials the actor.
@@ -63,5 +63,31 @@ func (s *Server) proxyFor(ready pool.Ready) *httputil.ReverseProxy {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			writeJSON(w, http.StatusBadGateway, detail{"actor connection failed: " + err.Error()})
 		},
+	}
+}
+
+// evictActor drops the per-actor proxy caches for a deleted actor (R3): the
+// dialers and transports map entries and the idle keep-alive connections the
+// cached *http.Transport still holds. It runs from the pool's OnActorDeleted
+// hook (long-idle sweep / backend delete — see New) and inline from the
+// console purge path (pool.ForgetByActorName fires no hook).
+//
+// Only IDLE connections close: http.Transport.CloseIdleConnections skips
+// connections with requests in flight, and an in-flight request's
+// ReverseProxy holds its own reference to the transport, unaffected by the
+// map delete — eviction can never sever a live proxied request (asserted by
+// TestEvictActorLeavesInFlightRequestsRunning). CloseIdleConnections also
+// retires the transport (net/http sets t.closeIdle, so a conn returning to
+// idle afterwards is closed instead of pooled): the in-flight conn shuts
+// down by itself when its response completes, and an evicted transport ends
+// up holding no sockets at all. Safe to call repeatedly and concurrently:
+// both caches are sync.Map; a Store/Delete race merely leaves a fresh entry
+// for a recreated actor, which the next delete evicts again.
+func (s *Server) evictActor(actorName string) {
+	s.dialers.Delete(actorName)
+	if v, loaded := s.transports.LoadAndDelete(actorName); loaded {
+		if tr, ok := v.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
 	}
 }
