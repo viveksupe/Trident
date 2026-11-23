@@ -107,19 +107,29 @@ func (c *specCache) save(templateRef, path string, body []byte) {
 	}
 }
 
-// serveSpec answers keyless spec/doc paths (/openapi.json, /docs, /redoc)
-// from the cache; on a miss it proxies to the actor as usual and records the
-// body for next time — under the fixed internal identity, never the caller's
-// headers. The goal is that no keyless poll spins up the adhoc actor.
+// serveSpec answers the keyless spec/doc paths (/openapi.json, /docs,
+// /redoc). GET and HEAD only: HEAD is served exactly like GET — net/http
+// discards the response body for HEAD at the server layer — so a cheap
+// probe still hits the cache. Every cache miss proxies under the FIXED
+// internal specFetchKey; nothing here ever routes through routeNoAuth, so
+// neither the request method nor the caller's X-User-Id/X-Session-Id can
+// choose which identity's actor gets created or woken. (HEAD used to fall
+// into routeNoAuth — Go's mux matches HEAD on GET patterns — which handed
+// keyless callers keyless Acquire under arbitrary identities; any other
+// method now gets a plain 405.)
 func (s *Server) serveSpec(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.routeNoAuth(w, r)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeJSON(w, http.StatusMethodNotAllowed, detail{"method not allowed"})
 		return
 	}
 	switch r.URL.Path {
 	case "/openapi.json", "/docs", "/redoc":
 	default:
-		s.routeNoAuth(w, r)
+		// Defensive: only the three spec paths are registered to serveSpec.
+		// If that ever widens, a stray path must degrade to a 404 — never
+		// to a keyless actor proxy under the caller's headers.
+		writeJSON(w, http.StatusNotFound, detail{"Not found"})
 		return
 	}
 	if body, ok := s.specs.load(s.cfg.TemplateRef, r.URL.Path); ok {
@@ -129,13 +139,16 @@ func (s *Server) serveSpec(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
+		_, _ = w.Write(body) // HEAD: the server strips the body itself
 		return
 	}
+	// Cache miss — for GET and HEAD alike — always under specFetchKey.
 	buf := &bytes.Buffer{}
 	sw := &specRecorder{ResponseWriter: w, buf: buf}
 	s.routeAs(r, sw, specFetchKey)
 	if sw.code == http.StatusOK {
+		// save() skips an empty body (a HEAD miss records nothing), so a
+		// HEAD can never poison the cache with a bodiless response.
 		s.specs.save(s.cfg.TemplateRef, r.URL.Path, buf.Bytes())
 	}
 }
