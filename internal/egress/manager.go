@@ -5,6 +5,7 @@ package egress
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -31,6 +32,21 @@ type PolicyClient interface {
 	// UpdateEgressPolicy replaces the actor's singleton policy.
 	UpdateEgressPolicy(ctx context.Context, atespace, name string, pol *ateapi.EgressPolicy) error
 }
+
+// MaxPendingGlobal bounds ALL actors' open requests together. The per-actor
+// cap (Manager.MaxPendingPerActor) is bypassed by a flood spread across
+// many claimed actor names — a claim is just a string on the wire — and
+// every pending row also spams the console queue an operator must review.
+// 512 = 10x the per-actor cap: a busy fleet (observer sweeps + helper polls)
+// stays comfortable while a flood tops out at six console pages (the
+// console's per_page max is 100). Checked best-effort — two concurrent
+// submits can both pass the count — and it only ever counts 'pending' rows,
+// so decided history never blocks a new ask.
+const MaxPendingGlobal = 512
+
+// ErrTooManyPending reports a full global queue; the facade maps it to
+// HTTP 429 (the per-actor cap keeps its plain 400).
+var ErrTooManyPending = errors.New("too many pending egress requests (global queue full)")
 
 // Manager wires the store to substrate policies.
 type Manager struct {
@@ -92,6 +108,12 @@ func (m *Manager) Submit(ctx context.Context, actor, host, reason string) (*Requ
 		// auto rule applies to it on the next ask.
 		m.approvePendingIfAuto(ctx, &existing[0])
 		return &existing[0], nil
+	}
+	// Global cap (see MaxPendingGlobal): placed AFTER the dedup above, so an
+	// actor re-asking about an already-filed (actor, host) still gets its id
+	// back even when the queue is full — only new rows are rejected.
+	if n, err := m.store.PendingCount(); err == nil && n >= MaxPendingGlobal {
+		return nil, ErrTooManyPending
 	}
 	atespace, ok, err := m.check(ctx, actor)
 	if err != nil {

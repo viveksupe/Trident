@@ -6,6 +6,7 @@ package facade
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -66,22 +67,17 @@ while true; do
 done
 `
 
-// RegisterEgress adds the callback + console routes. Disabled when the
-// shim was configured without an egress callback host.
-func (s *Server) RegisterEgress(mux *http.ServeMux) {
-	if s.egress == nil || s.cfg.EgressCallback == "" {
-		return
-	}
-	s.RegisterEgressActor(mux)
-	s.RegisterEgressConsole(mux)
-}
-
 // RegisterEgressActor registers ONLY the actor-facing callback endpoints
 // (helper script, request submission, status polling) on mux. The TLS
 // callback listener is built from this register alone: actors can reach this
 // listener by design (it sits behind the pre-approved callback rule), so the
-// human console and the front-side proxy must never be served here.
+// human console and the front-side proxy must never be served here. The
+// guard makes the register self-contained: both listeners now pick one half
+// of the split each, and neither half appears without a live egress flow.
 func (s *Server) RegisterEgressActor(mux *http.ServeMux) {
+	if s.egress == nil || s.cfg.EgressCallback == "" {
+		return
+	}
 	mux.HandleFunc("GET /_tri/egress/helper.sh", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		rendered := strings.ReplaceAll(helperScript, "%%CB%%", s.cfg.EgressCallback)
@@ -95,8 +91,14 @@ func (s *Server) RegisterEgressActor(mux *http.ServeMux) {
 }
 
 // RegisterEgressConsole registers the human console routes (Bearer console
-// token; LAN-reachable by design).
+// token; LAN-reachable by design). Part of Handler()'s main listener only —
+// never the callback listener.
 func (s *Server) RegisterEgressConsole(mux *http.ServeMux) {
+	if s.egress == nil || s.cfg.EgressCallback == "" {
+		// The console APIs dereference s.egress; without a live flow there
+		// is nothing to show or decide.
+		return
+	}
 	// Compat: pre-rename console bookmarks keep working.
 	for _, legacy := range []struct{ from, to string }{
 		{"/_tri/console/egress", "/_trident/console/egress"},
@@ -353,6 +355,12 @@ func (s *Server) egressRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := s.egress.Submit(r.Context(), body.Actor, body.Host, body.Reason)
 	if err != nil {
+		if errors.Is(err, egress.ErrTooManyPending) {
+			// The global pending cap is a queue-full condition, not a bad
+			// request: 429 tells the helper to back off and retry.
+			writeJSON(w, http.StatusTooManyRequests, detail{err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, detail{err.Error()})
 		return
 	}
@@ -360,12 +368,20 @@ func (s *Server) egressRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // egressRequestStatus answers the helper's poll. The requesting actor may
-// only see its own requests: when the (optional) ?actor= claim disagrees with
-// the stored request, the id reads as unknown.
+// only see its own requests: the ?actor= claim is MANDATORY — request ids
+// are sequential int64s, so an optional claim would let anyone who can
+// reach this listener enumerate every pending request's status. A missing
+// claim is a 400; a WRONG claim reads as 404, so the check itself never
+// confirms that an id exists (no enumeration oracle).
 func (s *Server) egressRequestStatus(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, detail{err.Error()})
+		return
+	}
+	claim := r.URL.Query().Get("actor")
+	if claim == "" {
+		writeJSON(w, http.StatusBadRequest, detail{"actor claim is required"})
 		return
 	}
 	req, err := s.egress.GetRequest(id)
@@ -373,7 +389,7 @@ func (s *Server) egressRequestStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, detail{"unknown request"})
 		return
 	}
-	if claim := r.URL.Query().Get("actor"); claim != "" && claim != req.ActorName {
+	if claim != req.ActorName {
 		writeJSON(w, http.StatusNotFound, detail{"unknown request"})
 		return
 	}
