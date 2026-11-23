@@ -248,3 +248,97 @@ func TestRevokeKeepsConcurrentlyApprovedGrantRule(t *testing.T) {
 		t.Fatalf("want exactly the approved grant live, got %+v", live)
 	}
 }
+
+// TestSubmitObservedEmptyHostNeverAutoApproves is finding S11's core: only
+// Approve validated the host, so maybeAutoApprove (observer + helper dedup
+// paths) could patch Hostnames:[""] into the policy — the substrate rejects
+// it and the observer then storms Get+Update every tick — or record a grant
+// with no hostname. The guards belong in approveRequestLocked, the one
+// funnel every approval entry point goes through.
+func TestSubmitObservedEmptyHostNeverAutoApproves(t *testing.T) {
+	const ats, actor = "ots", "ot-ua"
+	pol := newFakePolicyClient()
+	pol.setPolicy(ats, actor, &ateapi.EgressPolicy{}) // actor policy exists, no rules
+	m, st := newTestManager(t, pol)
+
+	// Standing auto rule: without the guard it grants Hostnames:[""].
+	if err := st.SetAuto(actor, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := m.SubmitObserved(context.Background(), ats, actor, "", "192.0.2.7",
+		"blocked egress to 192.0.2.7:443 (observed in gateway logs)")
+	if err != nil {
+		t.Fatalf("observed deny must file (not error) so the observer remembers it: %v", err)
+	}
+	if r.Status != StatusPending {
+		t.Fatalf("empty-host request auto-approved: status=%s", r.Status)
+	}
+	if n := pol.updateCount(); n != 0 {
+		t.Fatalf("policy patched %d time(s) for an un-nameable host", n)
+	}
+	if ruleOpensHost(pol.policy(ats, actor), "") {
+		t.Fatal(`policy gained a Hostnames:[""] rule`)
+	}
+	if live, _ := st.Live(); len(live) != 0 {
+		t.Fatalf("grants created without a hostname: %v", live)
+	}
+	if req, err := st.GetRequest(r.ID); err != nil || req.Status != StatusPending {
+		t.Fatalf("stored request must stay pending for the human: %+v %v", req, err)
+	}
+}
+
+// TestObserverRemembersStructurallyUnapprovableDeny covers the observer half
+// of S11: an un-nameable deny (no SNI, no PTR) must file as pending WITHOUT
+// erroring, so handle()'s existing rememberSeen arms the cooldown —
+// otherwise every 30s tick replays the line (the Get+Update storm) and piles
+// duplicate pending rows.
+func TestObserverRemembersStructurallyUnapprovableDeny(t *testing.T) {
+	const ats, actor, ip = "ots", "ot-ua", "192.0.2.7"
+	pol := newFakePolicyClient()
+	pol.setPolicy(ats, actor, &ateapi.EgressPolicy{})
+	m, st := newTestManager(t, pol)
+	if err := st.SetAuto(actor, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	checker := ActorChecker(func(context.Context, string) (string, bool, error) { return ats, true, nil })
+	o := NewObserver(m, checker, nil, "ate-system", "app=atenet-egress",
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Cancelled ctx models the no-PTR outcome deterministically (no network):
+	// the deny files with an empty host — the structurally-un-approvable
+	// outcome. The fake policy client and the store are ctx-agnostic, so the
+	// pre-fix auto-approve path still runs fully under this context.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	d := DenyLog{
+		Actor: "spiffe://ate/worker-for-actor/" + ats + "/" + actor,
+		Chain: "denied",
+		Dest:  ip + ":443",
+	}
+	o.handle(ctx, d)
+
+	key := actor + "|" + "" + "|" + ip // actor|host|ip with empty host
+	if !o.recentlySeen(key) {
+		t.Fatal("observer did not remember the structurally un-approvable deny: " +
+			"every 30s tick would replay it")
+	}
+	pending, err := st.Pending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Host != "" || pending[0].Status != StatusPending {
+		t.Fatalf("want one pending empty-host request, got %+v", pending)
+	}
+	if n := pol.updateCount(); n != 0 {
+		t.Fatalf("policy patched %d time(s) for an un-nameable host", n)
+	}
+
+	// The repeated line on the next tick must be absorbed by the cooldown.
+	o.handle(ctx, d)
+	if pending, _ := st.Pending(); len(pending) != 1 {
+		t.Fatalf("repeat deny created a duplicate: %d pending", len(pending))
+	}
+}
