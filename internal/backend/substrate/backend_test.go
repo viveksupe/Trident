@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/viveksupe/Trident/internal/model"
 )
+
+// --- C3 self-heal classification suite (fix/p0-revert-escalation-classification).
 
 // wrap mimics how Lifecycle.Revert reports errors (fmt.Errorf %w around the
 // gRPC status error), so the classifier is exercised against real wrapping.
@@ -297,4 +302,97 @@ func TestRetryTransientRevert(t *testing.T) {
 			t.Fatalf("cancellation must classify transient (never purge), got %v", classifyRevertError(err))
 		}
 	})
+}
+
+// newTestBackend wires a Backend whose lifecycle points at the fake client.
+func newTestBackend(f *fakeControl, l *Lifecycle) *Backend {
+	return &Backend{
+		lc:      l,
+		atspace: "test",
+		prefix:  "tri-",
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+// TestEnsureReadyEnsuresEgressPolicyEveryPass is the S8 regression test at
+// the EnsureReady level: the policy is read on every pass, a missing policy
+// (failed fire-once create) is repaired, and a TRI_EGRESS_HOSTS change
+// propagates to an already-running actor.
+func TestEnsureReadyEnsuresEgressPolicyEveryPass(t *testing.T) {
+	f := &fakeControl{actor: runningActor("test", "existing")}
+	l := newPolicyLifecycle(f)
+	b := newTestBackend(f, l)
+	key := model.NewRouteKey("user-1", "chat-1")
+	ctx := context.Background()
+
+	// Pass 1: RUNNING actor with NO policy (fire-once create was lost) →
+	// the pass creates it.
+	h, _, err := b.EnsureReady(ctx, key)
+	if err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if f.createPolicyCalls != 1 {
+		t.Fatalf("pass 1 must repair the missing policy, creates=%d", f.createPolicyCalls)
+	}
+	cb := findTls(f.policy.GetRules(), l.CallbackHost)
+	if cb == nil || !slices.Contains(cb.GetPorts().GetNumbers(), int32(9443)) {
+		t.Fatalf("repaired policy has wrong callback rule: %v", f.policy.GetRules())
+	}
+
+	// Pass 2: converged policy → read but not written.
+	if _, _, err := b.EnsureReady(ctx, key); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if f.getPolicyCalls != 2 {
+		t.Fatalf("policy must be read on every EnsureReady pass, reads=%d", f.getPolicyCalls)
+	}
+	if f.createPolicyCalls != 1 || f.updatePolicyCalls != 0 {
+		t.Fatalf("converged policy must not be written: create=%d update=%d",
+			f.createPolicyCalls, f.updatePolicyCalls)
+	}
+
+	// Host-list change → next pass patches the existing actor's policy.
+	l.EgressHosts = append(l.EgressHosts, "added.example.com")
+	if _, _, err := b.EnsureReady(ctx, key); err != nil {
+		t.Fatalf("pass 3: %v", err)
+	}
+	if f.getPolicyCalls != 3 || f.updatePolicyCalls != 1 {
+		t.Fatalf("host drift must produce exactly one read+update: get=%d update=%d",
+			f.getPolicyCalls, f.updatePolicyCalls)
+	}
+	if tp := findTls(f.lastUpdateRules, "added.example.com"); tp == nil {
+		t.Fatalf("new host did not reach the policy: %v", f.lastUpdateRules)
+	}
+	_ = h
+}
+
+// TestEnsureReadyCreatesPolicyForNewActor: the create path still guarantees
+// the policy before resume, on the configured callback port.
+func TestEnsureReadyCreatesPolicyForNewActor(t *testing.T) {
+	f := &fakeControl{} // no actor, no policy
+	l := newPolicyLifecycle(f)
+	b := newTestBackend(f, l)
+	key := model.NewRouteKey("user-1", "chat-2")
+	ctx := context.Background()
+
+	h, dialer, err := b.EnsureReady(ctx, key)
+	if err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+	if h == nil || dialer == nil {
+		t.Fatal("EnsureReady returned nil handle or dialer")
+	}
+	if f.createActorCalls != 1 {
+		t.Fatalf("actor not created: %d", f.createActorCalls)
+	}
+	if f.createPolicyCalls != 1 {
+		t.Fatalf("policy not created with the actor: %d", f.createPolicyCalls)
+	}
+	if f.resumeCalls != 1 {
+		t.Fatalf("fresh actor must be resumed once, resumes=%d", f.resumeCalls)
+	}
+	cb := findTls(f.policy.GetRules(), l.CallbackHost)
+	if cb == nil || !slices.Contains(cb.GetPorts().GetNumbers(), int32(9443)) {
+		t.Fatalf("callback rule wrong on create path: %v", f.policy.GetRules())
+	}
 }

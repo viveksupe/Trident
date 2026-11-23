@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -93,31 +92,144 @@ func createActor(ctx context.Context, client *APIClient, atespace, name, templat
 	return nil
 }
 
-// createActorEgressPolicy gives actor an egress policy with tls-passthrough
-// rules for hosts, leaving an existing policy in place (idempotent).
-func createActorEgressPolicy(ctx context.Context, client *APIClient, atespace, name string, hosts []string, callbackHost string) error {
-	rules := make([]*ateapi.EgressRule, 0, len(hosts))
-	for _, h := range hosts {
-		// Base allowlist hosts are TLS services: 443 only.
-		rules = append(rules, &ateapi.EgressRule{
-			TlsPassthrough: &ateapi.TlsPassthroughRule{
-				Hostnames: []string{h},
-				Ports:     &ateapi.Ports{Numbers: []int32{443}},
-			},
-		})
-	}
-	if callbackHost != "" {
-		// The in-sandbox DNS resolver only serves hosts with TLS rules, so
-		// the callback rides tls-passthrough; the shim terminates TLS on its
-		// callback port with a self-signed cert (agents use -k).
-		port := "8443"
-		if i := strings.LastIndex(callbackHost, ":"); i >= 0 {
-			port = strings.TrimPrefix(callbackHost[i+1:], ":")
+// ruleHasHostname reports whether host appears in hostnames.
+func ruleHasHostname(hostnames []string, host string) bool {
+	for _, h := range hostnames {
+		if h == host {
+			return true
 		}
-		name := strings.SplitN(callbackHost, ":", 2)[0]
-		rules = append(rules, callbackRule(name, port))
 	}
-	_, err := client.CreateActorEgressPolicy(ctx, &ateapi.CreateActorEgressPolicyRequest{
+	return false
+}
+
+// dropHostname removes one hostname from a list.
+func dropHostname(hostnames []string, host string) []string {
+	out := make([]string, 0, len(hostnames))
+	for _, h := range hostnames {
+		if h != host {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// tlsRule is one hostname's tls-passthrough rule. TLS-passthrough is
+// required for the callback: the in-sandbox DNS only resolves hosts whose
+// policy holds a TLS rule, and the shim terminates TLS itself (-k on the
+// actor side against the self-signed cert).
+func tlsRule(host string, ports []int32) *ateapi.EgressRule {
+	return &ateapi.EgressRule{
+		TlsPassthrough: &ateapi.TlsPassthroughRule{
+			Hostnames: []string{host},
+			Ports:     &ateapi.Ports{Numbers: append([]int32(nil), ports...)},
+		},
+	}
+}
+
+// callbackPort resolves the configured callback port, defaulting to the
+// historical 8443. S8: l.CallbackPort is authoritative — the old code
+// re-parsed a port out of the host-only CallbackHost and always yielded
+// 8443, silently dead-ending the approval flow on any other port.
+func callbackPort(configured string) int32 {
+	if n, err := strconv.ParseInt(configured, 10, 32); err == nil && n >= 1 && n <= 65535 {
+		return int32(n)
+	}
+	return 8443
+}
+
+// callbackRule allows the shim's callback listener on the configured port only.
+func callbackRule(host, port string) *ateapi.EgressRule {
+	return tlsRule(host, []int32{callbackPort(port)})
+}
+
+// desiredEgressRules collapses the shim's configuration into the rule set
+// every actor's policy must contain: one tls-passthrough rule per
+// TRI_EGRESS_HOSTS entry (443 only — they are TLS services) plus the callback
+// rule on the CONFIGURED CallbackPort (S8: never re-parsed from the host-only
+// CallbackHost string, which always yielded 8443). When the callback host
+// also appears in the base list its ports merge into one rule, so the ensure
+// reaches a fixed point instead of flip-flopping between two rules.
+func (l *Lifecycle) desiredEgressRules() []*ateapi.EgressRule {
+	type hostPorts struct {
+		host  string
+		ports []int32
+	}
+	var order []hostPorts
+	add := func(host string, port int32) {
+		for i := range order {
+			if order[i].host != host {
+				continue
+			}
+			for _, p := range order[i].ports {
+				if p == port {
+					return
+				}
+			}
+			order[i].ports = append(order[i].ports, port)
+			return
+		}
+		order = append(order, hostPorts{host: host, ports: []int32{port}})
+	}
+	// The in-sandbox DNS resolver only serves hosts with TLS rules, so the
+	// callback rides tls-passthrough; the shim terminates TLS on its callback
+	// port with a self-signed cert (agents use -k).
+	for _, h := range l.EgressHosts {
+		add(h, 443)
+	}
+	if l.CallbackHost != "" {
+		add(l.CallbackHost, callbackPort(l.CallbackPort))
+	}
+	rules := make([]*ateapi.EgressRule, 0, len(order))
+	for _, hp := range order {
+		rules = append(rules, tlsRule(hp.host, hp.ports))
+	}
+	return rules
+}
+
+// desiredCallbackRules is the callback-only slice EnsureCallbackRule repairs
+// against (diagnostics and legacy-rule migration entry point).
+func (l *Lifecycle) desiredCallbackRules() []*ateapi.EgressRule {
+	if l.CallbackHost == "" {
+		return nil
+	}
+	return []*ateapi.EgressRule{callbackRule(l.CallbackHost, l.CallbackPort)}
+}
+
+// EnsureEgressPolicy is the idempotent ensure that replaces fire-once policy
+// creation (S8): read the policy, compare against the desired rule set, and
+// patch only on drift. EnsureReady calls it on every pass, so a failed create
+// or a TRI_EGRESS_HOSTS change heals on the next request instead of stranding
+// the actor deny-by-default forever.
+func (l *Lifecycle) EnsureEgressPolicy(ctx context.Context, atespace, name string) error {
+	return l.ensureEgressRules(ctx, atespace, name, l.desiredEgressRules())
+}
+
+// ensureEgressRules creates the policy when it is missing (the repair path
+// for actors stranded by a failed fire-once create) or patches it when any
+// desired rule is unsatisfied. The policy is left completely untouched when
+// everything already matches — no update storms on hot EnsureReady passes.
+func (l *Lifecycle) ensureEgressRules(ctx context.Context, atespace, name string, desired []*ateapi.EgressRule) error {
+	if len(desired) == 0 {
+		return nil
+	}
+	pol, err := l.GetEgressPolicy(ctx, atespace, name)
+	if err != nil {
+		return err
+	}
+	if pol == nil {
+		return l.createEgressPolicy(ctx, atespace, name, desired)
+	}
+	merged, drift := l.mergeEgressRules(pol.Rules, desired)
+	if !drift {
+		return nil
+	}
+	pol.Rules = merged
+	return l.UpdateEgressPolicy(ctx, atespace, name, pol)
+}
+
+// createEgressPolicy creates the actor's singleton policy with rules.
+func (l *Lifecycle) createEgressPolicy(ctx context.Context, atespace, name string, rules []*ateapi.EgressRule) error {
+	_, err := l.client.CreateActorEgressPolicy(ctx, &ateapi.CreateActorEgressPolicyRequest{
 		Actor: objectRef(atespace, name),
 		EgressPolicy: &ateapi.EgressPolicy{
 			Metadata: &ateapi.ResourceMetadata{
@@ -128,6 +240,7 @@ func createActorEgressPolicy(ctx context.Context, client *APIClient, atespace, n
 		},
 	})
 	if status.Code(err) == codes.AlreadyExists {
+		// Lost a create race; the next ensure pass reconciles the rules.
 		return nil
 	}
 	if err != nil {
@@ -136,69 +249,126 @@ func createActorEgressPolicy(ctx context.Context, client *APIClient, atespace, n
 	return nil
 }
 
-// callbackRule is the allow rule for the shim's egress callback hostname.
-// TLS-passthrough is required: the in-sandbox DNS only resolves hosts whose
-// policy holds a TLS rule, and the shim terminates TLS itself (-k on the
-// actor side against the self-signed cert).
-func ruleHasHostname(hostnames []string, host string) bool {
-	for _, h := range hostnames {
-		if h == host {
+// mergeEgressRules folds the desired single-host rules into the existing
+// rule set. A desired pair is satisfied when some tls-passthrough rule
+// already contains the hostname with every wanted port; an unsatisfied pair
+// is repaired by stripping the hostname from tls rules that don't cover the
+// wanted ports (this is what self-corrects a stale callback port) and
+// appending the desired rule. Rules not touching a desired hostname — the
+// egress approval flow's grants — are never modified or dropped, and legacy
+// cleartext callback rules are migrated away while the callback host is being
+// repaired.
+func (l *Lifecycle) mergeEgressRules(existing, desired []*ateapi.EgressRule) ([]*ateapi.EgressRule, bool) {
+	out := append([]*ateapi.EgressRule(nil), existing...)
+	drift := false
+	for _, d := range desired {
+		host, ports := desiredHostPorts(d)
+		if host == "" {
+			continue
+		}
+		if tpCovers(out, host, ports) {
+			continue
+		}
+		drift = true
+		out = stripTlsHostname(out, host)
+		if host == l.CallbackHost {
+			out = dropHttpHostname(out, host)
+		}
+		out = append(out, d)
+	}
+	return out, drift
+}
+
+// desiredHostPorts reads the single hostname/ports pair a desired rule
+// carries (desiredEgressRules builds exactly one rule per host).
+func desiredHostPorts(d *ateapi.EgressRule) (string, []int32) {
+	tp := d.GetTlsPassthrough()
+	if tp == nil || len(tp.GetHostnames()) == 0 {
+		return "", nil
+	}
+	return tp.GetHostnames()[0], tp.GetPorts().GetNumbers()
+}
+
+// tpCovers reports whether some tls rule lets host reach every wanted port.
+func tpCovers(rules []*ateapi.EgressRule, host string, ports []int32) bool {
+	for _, r := range rules {
+		tp := r.GetTlsPassthrough()
+		if tp == nil || !ruleHasHostname(tp.GetHostnames(), host) {
+			continue
+		}
+		if tp.GetPorts().GetAll() != nil {
+			return true // all-ports rule covers everything; never strip it
+		}
+		if hasAllPorts(tp.GetPorts().GetNumbers(), ports) {
 			return true
 		}
 	}
 	return false
 }
 
-// callbackRule allows the shim's callback listener port only.
-func callbackRule(host, port string) *ateapi.EgressRule {
-	portNum, err := strconv.ParseInt(port, 10, 32)
-	if err != nil {
-		portNum = 8443
-	}
-	return &ateapi.EgressRule{
-		TlsPassthrough: &ateapi.TlsPassthroughRule{
-			Hostnames: []string{host},
-			Ports:     &ateapi.Ports{Numbers: []int32{int32(portNum)}},
-		},
-	}
-}
-
-// EnsureCallbackRule guarantees the callback rule exists for an existing
-// actor, migrating older cleartext-http callback rules to TLS rules.
-func (l *Lifecycle) EnsureCallbackRule(ctx context.Context, atespace, name string) error {
-	if l.CallbackHost == "" {
-		return nil
-	}
-	pol, err := l.GetEgressPolicy(ctx, atespace, name)
-	if err != nil {
-		return err
-	}
-	if pol == nil {
-		return fmt.Errorf("actor %s/%s has no egress policy", atespace, name)
-	}
-	for _, r := range pol.Rules {
-		if r.GetTlsPassthrough() != nil {
-			for _, h := range r.GetTlsPassthrough().GetHostnames() {
-				if h == l.CallbackHost {
-					return nil
-				}
+func hasAllPorts(have, want []int32) bool {
+	for _, w := range want {
+		found := false
+		for _, h := range have {
+			if h == w {
+				found = true
+				break
 			}
 		}
+		if !found {
+			return false
+		}
 	}
-	// Drop the legacy cleartext callback rule if present.
-	kept := make([]*ateapi.EgressRule, 0, len(pol.Rules)+1)
-	for _, r := range pol.Rules {
-		if r.GetHttp() != nil && ruleHasHostname(r.GetHttp().GetHostnames(), l.CallbackHost) {
+	return true
+}
+
+// stripTlsHostname removes host from every tls rule carrying it, dropping
+// rules left without hostnames.
+func stripTlsHostname(rules []*ateapi.EgressRule, host string) []*ateapi.EgressRule {
+	var out []*ateapi.EgressRule
+	for _, r := range rules {
+		tp := r.GetTlsPassthrough()
+		if tp == nil || !ruleHasHostname(tp.GetHostnames(), host) {
+			out = append(out, r)
 			continue
 		}
-		kept = append(kept, r)
+		if hn := dropHostname(tp.GetHostnames(), host); len(hn) > 0 {
+			out = append(out, &ateapi.EgressRule{TlsPassthrough: &ateapi.TlsPassthroughRule{
+				Hostnames: hn,
+				Ports:     tp.GetPorts(),
+			}})
+		}
 	}
-	port := l.CallbackPort
-	if port == "" {
-		port = "8443"
+	return out
+}
+
+// dropHttpHostname strips host from cleartext rules (the legacy callback
+// migration), keeping rules that still name other hosts.
+func dropHttpHostname(rules []*ateapi.EgressRule, host string) []*ateapi.EgressRule {
+	var out []*ateapi.EgressRule
+	for _, r := range rules {
+		h := r.GetHttp()
+		if h == nil || !ruleHasHostname(h.GetHostnames(), host) {
+			out = append(out, r)
+			continue
+		}
+		if hn := dropHostname(h.GetHostnames(), host); len(hn) > 0 {
+			out = append(out, &ateapi.EgressRule{Http: &ateapi.HttpRule{
+				Hostnames: hn,
+				Ports:     h.GetPorts(),
+			}})
+		}
 	}
-	pol.Rules = append(kept, callbackRule(l.CallbackHost, port))
-	return l.UpdateEgressPolicy(ctx, atespace, name, pol)
+	return out
+}
+
+// EnsureCallbackRule guarantees the callback rule exists with exactly the
+// configured host AND port for an actor, migrating older cleartext-http
+// callback rules to TLS rules. S8: the old hostname-only comparison let a
+// stale hard-coded-8443 rule mask a differently configured port, silently
+// killing the approval flow.
+func (l *Lifecycle) EnsureCallbackRule(ctx context.Context, atespace, name string) error {
+	return l.ensureEgressRules(ctx, atespace, name, l.desiredCallbackRules())
 }
 
 // GetActor returns the actor record, normalized to nil when absent.
@@ -218,13 +388,11 @@ func (l *Lifecycle) EnsureCreated(ctx context.Context, atespace, name string) er
 	if err := createActor(ctx, l.client, atespace, name, l.TemplateAtespace, l.TemplateName); err != nil {
 		return err
 	}
-	// An egress policy exists whenever the shim needs one: the base
-	// allowlist, or the callback rule alone (an empty EgressHosts used to
-	// silently disable the whole approval flow).
-	if len(l.EgressHosts) > 0 || l.CallbackHost != "" {
-		if err := createActorEgressPolicy(ctx, l.client, atespace, name, l.EgressHosts, l.CallbackHost); err != nil {
-			return err
-		}
+	// Guarantee the policy in the same pass so a fresh actor never resumes
+	// policy-less; EnsureReady's every-pass ensureEgressPolicy repairs
+	// anything this create loses (S8).
+	if err := l.EnsureEgressPolicy(ctx, atespace, name); err != nil {
+		return err
 	}
 	return nil
 }

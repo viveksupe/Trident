@@ -229,12 +229,15 @@ func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend
 		}
 	}
 
-	// Actors created before the egress-request flow existed lack the callback
-	// allow rule; ensure it once per resume cycle (cheap: read+patch, no-op
-	// when present).
-	if err := b.lc.EnsureCallbackRule(ctx, b.atspace, name); err != nil {
-		b.log.Warn("callback rule sync failed (egress requests disabled for this actor)",
-			"actor", name, "err", err)
+	// The egress policy is ensured on EVERY pass (S8): fire-once creation
+	// used to strand actors deny-by-default forever when one create failed,
+	// and TRI_EGRESS_HOSTS changes never propagated to existing actors. Now a
+	// failed create, a stale callback port, or a host-list change heals on
+	// the next request. A failure here only affects egress, so warn (not
+	// fail) — the next EnsureReady retries.
+	if err := b.lc.EnsureEgressPolicy(ctx, b.atspace, name); err != nil {
+		b.log.Warn("egress policy ensure failed; actor egress may be stale",
+			"actor", name, "key", key.LogString(), "err", err)
 	}
 
 	if created.IsZero() {
