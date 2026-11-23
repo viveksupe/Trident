@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/viveksupe/Trident/internal/pool"
 )
@@ -121,14 +122,26 @@ func (s *Server) spliceWS(w http.ResponseWriter, r *http.Request, ready pool.Rea
 }
 
 // mirrorFrames rewrites the first client auth frame, then mirrors both
-// directions until either side closes.
+// directions until either side closes. Whichever direction finishes closes
+// BOTH connections so the other side's blocked read unblocks, and the call
+// returns only after both directions have ended: spliceWS must never outlive
+// either socket, because routeNoAuth releases its inflight refcount only when
+// spliceWS returns (a one-directional teardown — a client dying while the
+// actor stays silent — pins the pool session forever: the sweep skips
+// sessions with inflight > 0).
 func (s *Server) mirrorFrames(clientBuf *bufio.Reader, clientConn net.Conn, actorBuf *bufio.Reader, actorConn net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
 	// Client → actor with first-frame rewrite, bounded scan: the protocol
 	// places the auth frame first; a hostile client sending non-auth frames
 	// still gets through after this loop gives up rewriting.
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer wg.Done()
+		// A dead client tears the session down from here: without these
+		// closes the actor→client copy below stays blocked on a silent actor
+		// and leaks the goroutine, both fds and the inflight refcount.
+		defer actorConn.Close()
+		defer clientConn.Close()
 		for i := 0; i < 8; i++ {
 			f, err := readWSFrame(clientBuf)
 			if err != nil {
@@ -151,8 +164,17 @@ func (s *Server) mirrorFrames(clientBuf *bufio.Reader, clientConn net.Conn, acto
 		_, _ = io.Copy(actorConn, bufioFirstThen{r: clientBuf, c: clientConn})
 	}()
 	// Actor → client: any buffered bytes first (the 101 was read through
-	// actorBuf), then raw copy.
-	_, _ = io.Copy(clientConn, bufioFirstThen{r: actorBuf, c: actorConn})
+	// actorBuf), then raw copy. Its exit closes both conns too, so a finished
+	// actor never strands the client→actor reader.
+	go func() {
+		defer wg.Done()
+		defer actorConn.Close()
+		defer clientConn.Close()
+		_, _ = io.Copy(clientConn, bufioFirstThen{r: actorBuf, c: actorConn})
+	}()
+	// Every exit path above closed both connections, which unblocks the peer
+	// direction — so this wait can only end with neither socket in use.
+	wg.Wait()
 }
 
 // bufioFirstThen reads the bufio.Reader to exhaustion, then the raw conn.
