@@ -449,14 +449,49 @@ func (l *Lifecycle) Delete(ctx context.Context, atespace, name string) error {
 	return nil
 }
 
+// maxListActorPages bounds the pagination loop against a server that cycles
+// page tokens forever.
+const maxListActorPages = 1000
+
 // ListActors returns actor metadata in one atespace (shim-created actors
-// carry the shim's prefix, which the caller filters on).
+// carry the shim's prefix, which the caller filters on), following
+// NextPageToken until the server reports the end. S9: the old code read a
+// single page, so any server-side truncation made restart reconcile prune
+// live sessions and release their actors from idle supervision. Restart
+// reconciliation prunes state based on this listing, so the listing must be
+// provably complete or an error: an empty page behind a continuation token
+// cannot be proven complete, and a repeated token would loop forever.
 func (l *Lifecycle) ListActors(ctx context.Context, atespace string) ([]*ateapi.Actor, error) {
-	resp, err := l.client.ListActors(ctx, &ateapi.ListActorsRequest{Atespace: atespace})
-	if err != nil {
-		return nil, fmt.Errorf("list actors in %s: %w", atespace, err)
+	var all []*ateapi.Actor
+	token := ""
+	for page := 0; ; page++ {
+		if page >= maxListActorPages {
+			return nil, fmt.Errorf("list actors in %s: exceeded %d pages; refusing a possibly-partial listing", atespace, maxListActorPages)
+		}
+		req := &ateapi.ListActorsRequest{Atespace: atespace}
+		if token != "" { // omit Options on the first request
+			req.Options = &ateapi.ListOptions{PageToken: token}
+		}
+		resp, err := l.client.ListActors(ctx, req)
+		if err != nil {
+			// Never surface a partial listing: callers prune on it.
+			return nil, fmt.Errorf("list actors in %s: %w", atespace, err)
+		}
+		actors, next := resp.GetActors(), resp.GetNextPageToken()
+		if next != "" {
+			if next == token {
+				return nil, fmt.Errorf("list actors in %s: page token repeated; refusing a possibly-partial listing", atespace)
+			}
+			if len(actors) == 0 {
+				return nil, fmt.Errorf("list actors in %s: empty page carries a continuation token; refusing a possibly-partial listing", atespace)
+			}
+		}
+		all = append(all, actors...)
+		if next == "" {
+			return all, nil
+		}
+		token = next
 	}
-	return resp.GetActors(), nil
 }
 
 // GetEgressPolicyForTest exposes the policy read (diagnostics only).
