@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deployment values for scripts/deploy.sh. Copy to manifest/values.sh or export
-# these before running deploy. Only OCI_REPO, WORKER_IMAGE and the three
-# secrets below are strictly required.
+# these before running deploy. Only OCI_REPO and WORKER_IMAGE are strictly
+# required — deploy.sh generates any unset secret below once and persists it
+# back into values.sh.
 
 # The registry repository for the actor image you pushed and built
 # (scripts/build-actor-image.sh prints the exact digest ref it produced).
@@ -20,9 +21,17 @@ export WORKER_IMAGE="ghcr.io/example/ateworker@sha256:fixed"
 # the front key AND can reach the shim's callback listener, so a shared key
 # would let an agent proxy to any user's actor. The console token gates the
 # human approval console and must not be guessable from either key.
-export TRI_API_KEY="${TRI_API_KEY:-$(openssl rand -hex 24)}"
-export TRI_ACTOR_API_KEY="${TRI_ACTOR_API_KEY:-$(openssl rand -hex 24)}"
-export TRI_CONSOLE_TOKEN="${TRI_CONSOLE_TOKEN:-$(openssl rand -hex 24)}"
+#
+# Left empty on purpose: scripts/deploy.sh generates any that are unset ONCE
+# and writes the value back into values.sh, so redeploys keep the same keys.
+# (The old "$(openssl rand -hex 24)" default re-randomized on EVERY source —
+# M6: Open WebUI's saved API key broke on each redeploy and the rotated actor
+# key cold-booted every chat actor.) Set a value here — or in the environment
+# — to choose it yourself; scripts/deploy.sh --rotate deliberately rolls all
+# three (maintenance window only: saved keys break, chat actors cold-boot).
+export TRI_API_KEY="${TRI_API_KEY:-}"
+export TRI_ACTOR_API_KEY="${TRI_ACTOR_API_KEY:-}"
+export TRI_CONSOLE_TOKEN="${TRI_CONSOLE_TOKEN:-}"
 
 # Substrate layout (defaults match the canonical install).
 export ATE_SYSTEM_NAMESPACE="ate-system"
