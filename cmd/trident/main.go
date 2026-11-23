@@ -310,6 +310,12 @@ func reconcileOnRestart(ctx context.Context, log *slog.Logger, backendImpl backe
 	known := map[string]bool{}
 	actors, err := backendImpl.ListReady(ctx)
 	if err != nil {
+		// ListReady only ever returns a provably complete listing or an
+		// error (S9: ListActors follows NextPageToken and refuses an empty
+		// page behind a continuation token). Refusing here is the only safe
+		// answer: pruning session rows or egress bookkeeping on a truncated
+		// list would orphan live actors and release them from idle
+		// supervision. Nothing above this point mutated any state.
 		return err
 	}
 	for _, a := range actors {
