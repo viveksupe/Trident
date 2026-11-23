@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/viveksupe/Trident/third_party/ateapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/viveksupe/Trident/internal/backend"
 	"github.com/viveksupe/Trident/internal/config"
@@ -48,6 +50,13 @@ type Backend struct {
 	log         *slog.Logger
 	// per-actor lifecycle op serialization
 	ops sync.Map // actor name -> *sync.Mutex
+	// selfHealStrikes tracks, per actor name, how many *consecutive*
+	// EnsureReady calls have produced affirmative restore-corruption evidence
+	// (finding C3). Delete — which purges the actor's durable /home/user
+	// volume — is only permitted at selfHealEscalationN strikes. Entries are
+	// cleared on success, on any non-corruption outcome, and after a purge,
+	// so the map stays bounded.
+	selfHealStrikes sync.Map // actor name -> int
 }
 
 var _ backend.Backend = (*Backend)(nil)
@@ -160,16 +169,45 @@ func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend
 		if err := b.lc.Resume(ctx, b.atspace, name); err != nil {
 			// Self-heal path: a restore failure (e.g. runsc restore crash on a
 			// partial snapshot) is recovered by reverting to the durable
-			// snapshot, or — when even that snapshot is unusable — by deleting
-			// and recreating the actor from the template's golden snapshot.
-			b.log.Warn("resume failed; attempting self-heal", "actor", name, "err", err)
-			if revErr := b.lc.Revert(ctx, b.atspace, name); revErr != nil {
-				b.log.Warn("revert failed; deleting and recreating the actor",
-					"actor", name, "err", revErr)
+			// snapshot, then re-creating-if-missing and resuming. Delete —
+			// which purges the actor's durable /home/user volume — is NEVER
+			// reached from a single failure: escalation requires affirmative
+			// (non-transient) Revert evidence in selfHealEscalationN
+			// consecutive EnsureReady calls (finding C3).
+			b.log.Warn("resume failed; attempting self-heal",
+				"actor", name, "key", key.LogString(), "err", err)
+
+			revErr := revertWithRetry(ctx, b.lc, b.log, b.atspace, name)
+			outcome := classifyRevertError(revErr)
+			strikes, purge := b.recordSelfHealOutcome(name, outcome)
+			if purge {
+				// Error level, route key included, strictly before the purge.
+				b.log.Error("purging actor after repeated restore-corruption evidence",
+					"actor", name, "key", key.LogString(),
+					"evidence", strikes, "threshold", selfHealEscalationN, "err", revErr)
 				if delErr := b.lc.Delete(ctx, b.atspace, name); delErr != nil {
 					return nil, nil, fmt.Errorf("delete during self-heal: %w", delErr)
 				}
-				created = time.Time{} // dropped its durable volume with it
+				b.clearSelfHealStrikes(name) // fresh actor, fresh evidence chain
+				created = time.Time{}        // dropped its durable volume with it
+			} else {
+				switch outcome {
+				case revertCorruption:
+					b.log.Error("revert failed definitively; purge withheld pending repeated evidence",
+						"actor", name, "key", key.LogString(),
+						"evidence", strikes, "threshold", selfHealEscalationN, "err", revErr)
+				case revertTransient:
+					// C3: transient Revert failures (deadline, transport,
+					// overload) never escalate to a purge. The recovery below
+					// is non-destructive: EnsureCreated is idempotent and Resume
+					// destroys nothing; if the actor still cannot resume, the
+					// error surfaces and the next EnsureReady call retries.
+					b.log.Warn("revert failed transiently; not escalating to delete",
+						"actor", name, "key", key.LogString(), "err", revErr)
+				case revertAbsent:
+					b.log.Warn("revert: actor already gone; recreating without purge",
+						"actor", name, "key", key.LogString())
+				}
 			}
 			if err := b.lc.EnsureCreated(ctx, b.atspace, name); err != nil {
 				return nil, nil, err
@@ -192,6 +230,9 @@ func (b *Backend) EnsureReady(ctx context.Context, key model.RouteKey) (*backend
 	if created.IsZero() {
 		created = time.Now()
 	}
+	// A fully successful EnsureReady breaks any consecutive-evidence chain
+	// (finding C3): strikes only accumulate across *failing* calls.
+	b.clearSelfHealStrikes(name)
 	return &backend.Handle{
 		Key: key, Name: name, CreatedAt: created, LastReadyAt: time.Now(),
 	}, &actorDialer{b: b, name: name}, nil
@@ -365,4 +406,152 @@ var _ backend.Dialer = (*actorDialer)(nil)
 // DialConn opens a new CONNECT tunnel.
 func (d *actorDialer) DialConn(ctx context.Context, _ string) (net.Conn, error) {
 	return d.b.dialer.DialActor(ctx, d.b.atspace, d.name, d.b.actorPort)
+}
+
+// --- resume self-heal escalation (finding C3) ------------------------------
+
+const (
+	// selfHealEscalationN is how many consecutive EnsureReady calls must
+	// each produce affirmative restore-corruption evidence before the
+	// self-heal path may purge (Delete) an actor. Delete destroys the actor's
+	// durable /home/user volume, so the bar is deliberately high: a transient
+	// blip can never satisfy it, and neither can a single definitive failure.
+	selfHealEscalationN = 3
+
+	// revertMaxAttempts bounds one self-heal Revert: the first attempt plus
+	// up to 2 retries of transient failures (spec budget: retry 2-3x).
+	revertMaxAttempts = 3
+
+	// revertRetryBackoff is the delay before the first transient Revert
+	// retry; it doubles after every subsequent retry.
+	revertRetryBackoff = 500 * time.Millisecond
+)
+
+// revertOutcome classifies a Revert result for self-heal escalation.
+type revertOutcome int
+
+const (
+	// revertRecovered: Revert succeeded (or was the substrate's documented
+	// no-op, e.g. FailedPrecondition on a suspended actor without a
+	// node-local snapshot). Normal recovery; nothing to escalate.
+	revertRecovered revertOutcome = iota
+	// revertTransient: transport, deadline, overload — or an error that
+	// cannot be classified at all. Retried with backoff and NEVER escalated
+	// to a purge.
+	revertTransient
+	// revertAbsent: the actor is already gone; recreating loses no data.
+	revertAbsent
+	// revertCorruption: the control plane affirmatively (non-transiently)
+	// refused the revert — restore-corruption evidence. Escalates to a purge
+	// only once it repeats selfHealEscalationN times consecutively.
+	revertCorruption
+)
+
+// transientRevertCodes lists the gRPC codes attributable to transport,
+// caller deadlines, or load (the A6-retryable subset), plus Internal and
+// Canceled. status.Code reports Unknown for *any* non-gRPC error, so Unknown
+// is deliberately transient too: a purge may only ever be granted on an
+// affirmative, structured, non-retryable answer from the control plane.
+var transientRevertCodes = map[codes.Code]bool{
+	codes.Unavailable:       true,
+	codes.DeadlineExceeded:  true,
+	codes.Aborted:           true,
+	codes.ResourceExhausted: true,
+	codes.Internal:          true,
+	codes.Canceled:          true,
+	codes.Unknown:           true,
+	codes.OK:                true, // unreachable for err != nil; defensive
+}
+
+// classifyRevertError is a pure classifier from a Revert error to the
+// self-heal outcome buckets. It unwraps fmt.Errorf %w chains (status.Code
+// resolves through errors.As), which is how Lifecycle.Revert reports errors.
+func classifyRevertError(err error) revertOutcome {
+	if err == nil {
+		return revertRecovered
+	}
+	code := status.Code(err)
+	if code == codes.NotFound {
+		return revertAbsent
+	}
+	if transientRevertCodes[code] {
+		return revertTransient
+	}
+	// DataLoss is the archetype here; FailedPrecondition, InvalidArgument,
+	// Unimplemented, PermissionDenied &c. are all affirmative server answers
+	// (gRPC A6 non-retryable set) rather than lost-round-trip artifacts.
+	return revertCorruption
+}
+
+// selfHealDecision is the pure escalation classifier: given the actor's
+// previous consecutive-evidence strike count and this call's classified
+// outcome, it returns the updated strike count and whether a purge
+// (Delete — which destroys durable data) is permitted. Only revertCorruption
+// increments the chain; every other outcome resets it to zero, so transient
+// failures alone — or a single definitive failure — can never trigger a
+// purge, no matter how often they occur.
+func selfHealDecision(prevStrikes int, outcome revertOutcome) (strikes int, purge bool) {
+	if outcome != revertCorruption {
+		return 0, false
+	}
+	strikes = prevStrikes + 1
+	return strikes, strikes >= selfHealEscalationN
+}
+
+// recordSelfHealOutcome applies selfHealDecision to the actor's stored
+// strike count and persists the result. A zero count deletes the entry, so
+// the map only ever holds actors with strikes in flight.
+func (b *Backend) recordSelfHealOutcome(name string, outcome revertOutcome) (strikes int, purge bool) {
+	prev := 0
+	if v, ok := b.selfHealStrikes.Load(name); ok {
+		prev, _ = v.(int)
+	}
+	strikes, purge = selfHealDecision(prev, outcome)
+	if strikes == 0 {
+		b.selfHealStrikes.Delete(name)
+	} else {
+		b.selfHealStrikes.Store(name, strikes)
+	}
+	return strikes, purge
+}
+
+// clearSelfHealStrikes breaks an actor's consecutive-evidence chain: after
+// a fully successful EnsureReady or a completed purge, the next definitive
+// failure starts counting from scratch.
+func (b *Backend) clearSelfHealStrikes(name string) {
+	b.selfHealStrikes.Delete(name)
+}
+
+// revertWithRetry runs Lifecycle.Revert, retrying only transient failures
+// with backoff; definitive and absent answers return immediately.
+func revertWithRetry(ctx context.Context, lc *Lifecycle, log *slog.Logger, atespace, name string) error {
+	return retryTransientRevert(ctx, log, name, revertRetryBackoff, func(ctx context.Context) error {
+		return lc.Revert(ctx, atespace, name)
+	})
+}
+
+// retryTransientRevert is the testable core of revertWithRetry: it calls
+// revert, and while the outcome classifies as revertTransient it retries up
+// to revertMaxAttempts total attempts with exponential backoff. On context
+// cancellation it returns the ctx error, which classifies as transient —
+// and therefore never escalates to a purge.
+func retryTransientRevert(ctx context.Context, log *slog.Logger, name string, backoff time.Duration, revert func(context.Context) error) error {
+	var err error
+	for attempt := 1; attempt <= revertMaxAttempts; attempt++ {
+		if attempt > 1 {
+			log.Warn("transient revert failure; retrying",
+				"actor", name, "attempt", attempt, "backoff", backoff, "err", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+		err = revert(ctx)
+		if err == nil || classifyRevertError(err) != revertTransient {
+			return err
+		}
+	}
+	return err
 }
