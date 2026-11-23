@@ -37,6 +37,12 @@ export TRI_CONSOLE_TOKEN="${TRI_CONSOLE_TOKEN:-}"
 export ATE_SYSTEM_NAMESPACE="ate-system"
 export TRI_NAMESPACE="trident"
 
+# Actor-name prefix, envsubst'd into the Deployment (TRI_ACTOR_PREFIX).
+# Must match how actors are actually named — config default and README say
+# ot-; the manifest used to hardcode tri-, scoping reconcile/cleanup at the
+# wrong actors. 2-15 lowercase-alphanumeric chars ending in '-'.
+export TRI_ACTOR_PREFIX="ot-"
+
 # Atespace for chat actors + the ActorTemplate name.
 export ATESPACE="ots-webui"
 export TEMPLATE_NAME="open-terminal"

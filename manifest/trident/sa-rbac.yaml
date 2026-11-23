@@ -1,5 +1,6 @@
-# RBAC for trident (rendered by scripts/deploy.sh with the substrate system
-# namespace; defaults below assume ate-system).
+# RBAC + shim Secret for trident (rendered by scripts/deploy.sh with the
+# substrate system namespace and the values-file secrets; smoke-checked by
+# scripts/render-manifest.sh. Defaults below assume ate-system).
 #
 # The namespace must also carry the label the substrate network policies use to
 # admit ateapi clients (docs: ate-system NetworkPolicy allows API clients from
