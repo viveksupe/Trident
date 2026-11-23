@@ -42,24 +42,66 @@ Open WebUI ──Open Terminal protocol (HTTP+WS)──▷ trident
   (port 8444)**, whose route timeout is 0 — long agent WebSockets and file
   streams never hit envoy's 5-minute HTTP cap on the :443 ingress path.
 
-## Quickstart (kind: substrate quickstart cluster)
+## Deployment (in-cluster: trident as the shim/gateway)
+
+The **primary** deployment runs trident in the cluster, as the Open WebUI ↔
+substrate gateway: Deployment + both Services in `manifest/trident/`
+(`trident` :80→8080 is what Open WebUI points at; `trident-callback` :8443
+is what actors reach for egress callbacks), RBAC + Secret in
+`manifest/trident/sa-rbac.yaml` — all rendered with envsubst from
+`manifest/values.sh`:
+
+```bash
+# 0. Prerequisites: a substrate cluster + kubectl context (KUBECONFIG), and
+#    the image refs from "Repositories" (OCI_REPO, WORKER_IMAGE).
+cp manifest/values.sh.example manifest/values.sh   # edit the image refs
+scripts/deploy.sh        # --rotate rolls all three secrets (maintenance only)
+```
+
+`scripts/deploy.sh` fails fast if `KUBECONFIG`, `envsubst` or `kubectl` is
+missing (before the image build), then: actor image build/push (skip with a
+digest-pinned `ACTOR_IMAGE`) → WorkerPool → **`bin/trident` built on
+demand** (`scripts/build-trident.sh`) + ActorTemplate bootstrap → RBAC +
+shim Secret → Deployment + Services. Any secret left unset in `values.sh`
+is generated **once** and persisted back into the file, so redeploys keep
+the same keys; `--rotate` deliberately rolls all three (loud: breaks
+Open WebUI's saved key and cold-boots chat actors).
+
+**The repo no longer tracks a prebuilt `trident` binary** — build from
+source:
+
+```bash
+scripts/build-trident.sh                        # -> bin/trident (static, CGO_ENABLED=0)
+CGO_ENABLED=0 go build -o trident ./cmd/trident  # root file, for images/trident/Dockerfile
+```
+
+Smoke-render every manifest (no cluster needed; suitable as a CI step):
+
+```bash
+scripts/render-manifest.sh
+```
+
+`TRI_BACKEND=substrate` is the primary path (the Deployment pins it).
+`TRI_BACKEND=docker` remains the documented dev/demo fallback below.
+
+### Development: kind + out-of-cluster shim
 
 ```bash
 # 0. A substrate cluster (the repo's quickstart on kind):
 #    hack/create-kind-cluster.sh; ATE_INSTALL_KIND=true go run ./cmd/ate-setup deploy ate-system ...
 # 1. Build the actor image and print its pinned digest:
 OCI_REPO=ghcr.io/you/ot-actor scripts/build-actor-image.sh
-# 2. Create atespace + ActorTemplate (waits for the golden snapshot):
-trident bootstrap -image ghcr.io/you/ot-actor@sha256:...
-# 3. Apply the worker pool, RBAC and the Trident Deployment:
+# 2. Full deploy (WorkerPool, bootstrap, RBAC, Deployment) against it:
 cp manifest/values.sh.example manifest/values.sh  # edit values
-scripts/deploy.sh
-# 4. Or run trident out-of-cluster against the kind cluster:
+scripts/deploy.sh            # KUBECONFIG=<kind config>
+# ...or run the shim on the host against the cluster:
 TRI_BACKEND=substrate TRI_API_KEY=... TRI_ACTOR_API_KEY=... \
 TRI_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
 ```
 
-For development **without a cluster** (M0 path):
+### Fallback: docker demo mode (no cluster, M0 path)
+
+For development **without a cluster**:
 
 ```bash
 docker buildx build -t ot-actor:dev images/actor
@@ -116,9 +158,11 @@ with `--env-file`). Pre-rename `OTS_*` variables still work as fallbacks where
 `TRI_*` names are unset. The deployed instance's env can be kept in a file such
 as `/home/vsupe/.ot-trident.env` (docker `--env-file`-compatible).
 
-Substrate layout: `manifest/actor` → embedded ActorTemplate,
+Substrate layout: ActorTemplate → embedded in
+`internal/backend/substrate` (bootstrapped by `bin/trident bootstrap`),
 `manifest/workers/workerpool.yaml.tmpl` → WorkerPool CRD,
-`manifest/trident/` → Deployment + RBAC.
+`manifest/trident/` → Deployment + Services + RBAC + Secret, all
+values-driven from `manifest/values.sh`.
 
 ## Caveats (known, deliberate)
 
@@ -149,6 +193,7 @@ Substrate layout: `manifest/actor` → embedded ActorTemplate,
 
 ```
 cmd/trident/            serve | bootstrap | version
+.github/workflows/      ci: gofmt (repo-wide) / vet / build / test -race
 internal/facade/        frontend: auth, /api/config, /templates 404, per-actor reverse proxy
 internal/pool/          chat→actor map, singleflight, idle/max-age ticker, WS refcounts
 internal/backend/       Backend interface
@@ -159,11 +204,23 @@ internal/model/         RouteKey identity + actor naming
 third_party/ateapi/     generated ateapi gRPC stubs (copied from substrate, Apache-2.0)
 third_party/_reference-sources/  build-ignored copies the adapted code is drawn from
 images/actor/           open-terminal + agent CLIs actor image
-manifest/               deploy templates (actor template, worker pool, shim, RBAC, values)
-scripts/                build/deploy/e2e helpers
+images/trident/         shim image (COPYs the locally built binary — not tracked)
+manifest/               deploy templates (worker pool, shim Deployment/Services/RBAC, values)
+scripts/                helpers: build-actor-image, build-trident, deploy, render-manifest, kind, e2e
 ```
 
 ## Verification
+
+CI (`.github/workflows/ci.yml`) runs on every push/PR: repo-wide
+`gofmt -l .` must be empty, then `go vet ./...`, `go build ./...`,
+`go test ./... -race`. Reproduce it locally:
+
+```bash
+test -z "$(gofmt -l .)" && go vet ./... && go build ./... && go test ./... -race
+scripts/render-manifest.sh   # manifest smoke render (envsubst + YAML parse)
+```
+
+The test suite itself:
 
 ```bash
 go test ./test/          # facade, pool, sessionmap, routekey unit tests
