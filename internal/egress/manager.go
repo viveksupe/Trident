@@ -63,17 +63,52 @@ type Manager struct {
 	// untrusted input: otherwise one actor can flood the console queues).
 	MaxPendingPerActor int
 
-	// policyLocks serializes read-modify-write of one actor's egress policy
-	// across the console, auto-approve, observer and revoke ticker.
-	policyLocks sync.Map // actor name -> *sync.Mutex
+	// policyShards is a FIXED-SIZE sharded lock table serializing
+	// read-modify-write of an actor's egress policy across the console,
+	// auto-approve, observer and revoke ticker (finding R3: the previous
+	// actor->mutex sync.Map grew unbounded with actor churn). Same actor ->
+	// same shard, so per-actor exclusion is byte-for-byte the old semantic;
+	// distinct actors usually land on different shards and proceed in
+	// parallel, while a hash collision merely over-serializes two
+	// independent actors — it never weakens the per-actor guarantee. No
+	// code path acquires two actors' locks while holding one (approve,
+	// revoke and GrantFullInternet each lock a single name; addRule/
+	// removeRule only assume the caller's lock), so shard sharing cannot
+	// deadlock. Memory is constant for the manager's lifetime.
+	policyShards [policyLockShards]sync.Mutex
 }
 
+// policyLockShards is the width of Manager.policyShards — a power of two,
+// two orders of magnitude above any plausible concurrent-actor count so
+// accidental collisions between live actors stay negligible.
+const policyLockShards = 256
+
 // lockPolicy serializes policy RMW for actor.
+//
+// Semantics are unchanged from the old per-actor map: two calls for the
+// SAME actor are fully serialized (one actor = one logical lock). Calls for
+// different actors are serialized only when they collide on a shard — pure
+// over-serialization, safe because every critical section assumes only its
+// own actor's exclusion.
 func (m *Manager) lockPolicy(actor string) func() {
-	v, _ := m.policyLocks.LoadOrStore(actor, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
+	mu := &m.policyShards[policyShardIndex(actor)]
 	mu.Lock()
 	return mu.Unlock
+}
+
+// policyShardIndex is FNV-1a over the actor name, folded into the table.
+// Deterministic (no runtime seeding) so shard placement is testable.
+func policyShardIndex(actor string) uint32 {
+	const (
+		fnvOffset32 = 2166136261
+		fnvPrime32  = 16777619
+	)
+	h := uint32(fnvOffset32)
+	for i := 0; i < len(actor); i++ {
+		h ^= uint32(actor[i])
+		h *= fnvPrime32
+	}
+	return h % policyLockShards
 }
 
 // actorPrefix is read by the log observer.
