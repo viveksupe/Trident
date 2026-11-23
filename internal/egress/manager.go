@@ -127,6 +127,18 @@ func (m *Manager) approvePendingIfAuto(ctx context.Context, r *Request) {
 // with the rule's TTL. Logged loudly — this is deliberate standing
 // permission, not a silent bypass.
 func (m *Manager) maybeAutoApprove(ctx context.Context, r *Request) error {
+	if r.Host == "" || !validHost(r.Host) {
+		// Structurally un-approvable: observed denies file with an empty host
+		// until the human names it, and a standing rule must never silently
+		// grant an empty/invalid hostname. The request stays pending for the
+		// console. Returning success (not an error) lets SubmitObserved hand
+		// the outcome back normally so the observer's rememberSeen arms its
+		// cooldown — erroring here made every 30s tick replay the deny line
+		// (the Get+Update storm).
+		m.log.Debug("auto-approve skipped: request has no valid hostname",
+			"request", r.ID, "actor", r.ActorName, "host", r.Host)
+		return nil
+	}
 	auto, ok, err := m.store.AutoFor(r.ActorName)
 	if err != nil || !ok {
 		return err
@@ -148,6 +160,18 @@ func (m *Manager) maybeAutoApprove(ctx context.Context, r *Request) error {
 // up here (console Approve, auto-approve), so this is also where the host
 // guards must live.
 func (m *Manager) approveRequestLocked(ctx context.Context, req Request, ttl time.Duration) error {
+	// Host guards for EVERY approval entry point (console Approve,
+	// auto-approve, observer-filed requests): grantRules("") would patch
+	// Hostnames:[""] into the substrate policy — rejected there, and the
+	// failing patch then re-ran the whole flow on every observer tick — or
+	// record a grant with no hostname at all. Approve guarded alone; the
+	// auto-approve path proved that insufficient.
+	if req.Host == "" {
+		return fmt.Errorf("request %d has no hostname — correct it before approving", req.ID)
+	}
+	if !validHost(req.Host) {
+		return fmt.Errorf("request %d hostname %q is not a valid hostname", req.ID, req.Host)
+	}
 	// Hold the actor's policy lock across patch + grant insertion: revokeGrant
 	// decides from a fresh grant read under this same lock, so the approval
 	// must be atomic with respect to it — otherwise a revoke can read "no
@@ -197,12 +221,8 @@ func (m *Manager) Approve(ctx context.Context, requestID int64, ttl time.Duratio
 	if !ok {
 		return fmt.Errorf("request %d not found", requestID)
 	}
-	if req.Host == "" {
-		return fmt.Errorf("request %d has no hostname — correct it before approving", requestID)
-	}
-	if !validHost(req.Host) {
-		return fmt.Errorf("request %d hostname %q is not a valid hostname", requestID, req.Host)
-	}
+	// Host guards live in approveRequestLocked — the funnel every approval
+	// entry point (this console path, the standing-rule auto path) goes through.
 	if err := m.approveRequestLocked(ctx, req, ttl); err != nil {
 		return err
 	}
