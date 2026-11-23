@@ -291,9 +291,13 @@ func (p *Pool) sweep(ctx context.Context) {
 
 	p.mu.Lock()
 	for key, ses := range p.ses {
-		// Never touch sessions with in-flight requests (HTTP or spliced WS)
-		// or ones already being swept by a concurrent pass.
-		if ses.inflight > 0 || ses.sweeping {
+		// Never touch sessions with in-flight requests (HTTP or spliced WS),
+		// ones already being swept by a concurrent pass, or ones still inside
+		// EnsureReady: those are registered into the map before the backend
+		// returns (handle == nil) and must not be aged out mid-create —
+		// dereferencing the nil handle here would panic RunTicker (and the
+		// process) on any tick landing inside an actor create.
+		if ses.inflight > 0 || ses.sweeping || ses.handle == nil {
 			continue
 		}
 		var victimReason string
