@@ -55,14 +55,15 @@ trident bootstrap -image ghcr.io/you/ot-actor@sha256:...
 cp manifest/values.sh.example manifest/values.sh  # edit values
 scripts/deploy.sh
 # 4. Or run trident out-of-cluster against the kind cluster:
-TRI_BACKEND=substrate TRI_API_KEY=... TRI_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
+TRI_BACKEND=substrate TRI_API_KEY=... TRI_ACTOR_API_KEY=... \
+TRI_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
 ```
 
 For development **without a cluster** (M0 path):
 
 ```bash
 docker buildx build -t ot-actor:dev images/actor
-TRI_API_KEY=test-key \
+TRI_API_KEY=test-key TRI_ACTOR_API_KEY=test-actor-key \
 TRI_BACKEND=docker TRI_DOCKER_IMAGE=ot-actor:dev \
 TRI_LISTEN_ADDR=127.0.0.1:8080 bin/trident serve
 ```
@@ -85,7 +86,7 @@ Stop (`DELETE` the session) and continuation (resume from the chat's snapshot).
 | Var | Default | Meaning |
 |---|---|---|
 | `TRI_API_KEY` | (required) | front-side Bearer key Open WebUI presents |
-| `TRI_ACTOR_API_KEY` | (required with egress flow; must differ from `TRI_API_KEY`) | actor-side key, baked into the ActorTemplate as `OPEN_TERMINAL_API_KEY`; the facade translates Authorization headers and the first WS auth frame |
+| `TRI_ACTOR_API_KEY` | (required; must differ from `TRI_API_KEY`) | actor-side key, baked into the ActorTemplate as `OPEN_TERMINAL_API_KEY`; the facade translates Authorization headers and the first WS auth frame. Startup fails unless the two keys differ — an equal key would put the front-side credential in every sandbox |
 | `TRI_CONSOLE_TOKEN` | (required with egress flow) | human-only console token (≠ `TRI_API_KEY`); manages the approval UI. Never embedded in console pages — save it once in the browser's token widget (🔑, top-right) |
 | `TRI_BACKEND` | `substrate` | `substrate` or `docker` (dev) |
 | `TRI_STATE_DB` | `sessionmap.db` | sqlite chat→actor map + egress bookkeeping |
@@ -122,7 +123,8 @@ Substrate layout: `manifest/actor` → embedded ActorTemplate,
 ## Caveats (known, deliberate)
 
 - **Keys (security model):** the actor key must be distinct from the front
-  key whenever the egress flow is on. Agents hold the front key (it doubles as
+  key — enforced unconditionally at startup, with or without the egress
+  flow, on both backends. Agents hold the front key (it doubles as
   `OPEN_TERMINAL_API_KEY` in the sandbox) and can reach the shim's TLS
   callback listener, so the facade translates credentials outbound:
   Authorization headers are rewritten, and terminal/agent WebSocket auth
