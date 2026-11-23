@@ -159,7 +159,8 @@ func (s *Server) routeAs(r *http.Request, w http.ResponseWriter, key model.Route
 	ready, inflight, err := s.pl.Acquire(r.Context(), key)
 	if err != nil {
 		s.log.Warn("acquire failed", "key", key.LogString(), "path", r.URL.Path, "err", err)
-		writeJSON(w, http.StatusBadGateway, detail{"actor not ready: " + err.Error()})
+		code, d := acquireStatus(err)
+		writeJSON(w, code, d)
 		return
 	}
 	defer inflight.Done()
